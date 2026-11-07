@@ -1,0 +1,29 @@
+[package]
+name = "vcode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+description = "A terminal coding agent running Qwen locally with biv"
+
+[dependencies]
+# the inference engine, and the CLI crate for model files (mmap, shards, the Hugging Face cache)
+biv = { git = "https://github.com/vincenthz/biv" }
+biv-cli = { git = "https://github.com/vincenthz/biv" }
+globset = "0.4.21"
+ignore = "0.4.34"
+ratatui = "0.30.2"
+regex = "1.13.1"
+similar = "3.2.1"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+biv = { git = "https://github.com/vincenthz/biv", features = ["metal"] }
+
+[profile.dev.package."*"]
+# unoptimized biv kernels make inference unusably slow in debug builds
+opt-level = 3
+
+[profile.release]
+lto = "thin"
