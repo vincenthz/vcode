@@ -47,6 +47,9 @@ usage: vcode [options] [directory]
   -c, --ctx <n>            context size in tokens [default: 65536]
       --sub-ctx <n>        context size of the subagents the agent gives tasks
                            to, 0 for no subagents [default: 32768]
+      --parallel <n>       subagents working at the same time at most, their
+                           passes batched on the engine; 1 for one at a time
+                           [default: 4]
   -n, --max-tokens <n>     tokens per answer, reasoning included [default: 16384]
       --cpu                run on the CPU instead of the GPU
   -d, --draft <n>          tokens drafted per step by the MTP head [default: engine's]
@@ -81,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
             lookup: 7,
             temperature: None,
             cwd: std::env::current_dir().map_err(|e| e.to_string())?,
+            parallel: 4,
         },
         prompt: None,
         yolo: false,
@@ -106,6 +110,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "-c" | "--ctx" => a.cfg.context = num(&flag, val()?)?,
             "--sub-ctx" => a.cfg.sub_context = num(&flag, val()?)?,
+            "--parallel" => {
+                a.cfg.parallel = num(&flag, val()?)?;
+                if a.cfg.parallel == 0 {
+                    return Err("--parallel: at least 1".into());
+                }
+            }
             "-n" | "--max-tokens" => a.cfg.max_tokens = num(&flag, val()?)?,
             "--cpu" => a.cfg.cpu = true,
             "-d" | "--draft" => a.cfg.draft = Some(num(&flag, val()?)?),
@@ -170,6 +180,10 @@ fn headless(
     msgs: std::sync::mpsc::Receiver<Msg>,
 ) -> i32 {
     let mut out = std::io::stdout();
+    // the text of each subagent's current turn: subagents working at the
+    // same time would mix their streams
+    let mut texts: std::collections::HashMap<usize, String> = Default::default();
+    let mut tasks = std::collections::HashSet::new();
     let mut sent = false;
     let mut status = 0;
     let mut mid_line = false;
@@ -180,16 +194,22 @@ fn headless(
     };
     for m in msgs {
         // a subagent's messages: its calls indented, its text dimmed
-        let (sub, m) = match m {
-            Msg::Sub { msg, .. } => (true, *msg),
-            m => (false, m),
+        let (task, m) = match m {
+            Msg::Sub { task, msg } => (Some(task), *msg),
+            m => (None, m),
         };
-        let indent = if sub { "   | " } else { "" };
+        let sub = task.is_some();
+        let indent = task.map_or(String::new(), |t| format!("   #{t} | "));
         match m {
             Msg::Thinking(_) | Msg::ThinkingDone if sub => {}
-            Msg::Answer(t) if sub => {
-                let _ = write!(out, "\x1b[2m{t}\x1b[0m");
-                mid_line = !t.ends_with('\n');
+            Msg::Answer(t) if let Some(task) = task => texts.entry(task).or_default().push_str(&t),
+            Msg::TurnDone { stats, .. } if let Some(task) = task => {
+                nl(&mut out, &mut mid_line);
+                let text = texts.remove(&task).unwrap_or_default();
+                for line in text.trim().lines() {
+                    let _ = writeln!(out, "{indent}\x1b[2m{line}\x1b[0m");
+                }
+                eprintln!("{indent}[{stats}]");
             }
             Msg::Status(s) if !s.is_empty() => eprintln!("[{s}]"),
             Msg::Ready {
@@ -219,11 +239,20 @@ fn headless(
                 mid_line = !t.ends_with('\n');
             }
             Msg::ToolStart {
-                tool, title, diff, ..
+                id,
+                tool,
+                title,
+                diff,
             } => {
                 nl(&mut out, &mut mid_line);
                 let name = tool.map_or("unknown function", tools::Tool::name);
-                let _ = writeln!(out, "{indent}-> {name}: {title}");
+                let tag = if tool == Some(tools::Tool::Task) {
+                    tasks.insert(id);
+                    format!(" #{id}")
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(out, "{indent}-> {name}{tag}: {title}");
                 if let Some(d) = diff {
                     let (a, r) = tools::count_changes(&d);
                     let _ = writeln!(out, "{indent}   (+{a} -{r})");
@@ -238,11 +267,17 @@ fn headless(
                     ))
                 });
             }
-            Msg::ToolDone { ok, summary, .. } => {
+            Msg::ToolDone { id, ok, summary } => {
+                nl(&mut out, &mut mid_line);
                 let _ = writeln!(
                     out,
-                    "{indent}<- {}{summary}",
-                    if ok { "" } else { "FAILED " }
+                    "{indent}<- {}{summary}{}",
+                    if ok { "" } else { "FAILED " },
+                    if tasks.contains(&id) {
+                        format!(" (#{id})")
+                    } else {
+                        String::new()
+                    }
                 );
             }
             Msg::Plan { overview, tasks } => {

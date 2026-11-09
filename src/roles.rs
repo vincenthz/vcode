@@ -132,6 +132,14 @@ of each."
         }
     }
 
+    /// It can edit or write files: its tasks run alone, never at the same
+    /// time as others
+    pub fn changes_files(self) -> bool {
+        self.tools()
+            .iter()
+            .any(|t| matches!(t, Tool::EditFile | Tool::WriteFile))
+    }
+
     /// Tool calls for one task at most
     pub fn max_steps(self) -> usize {
         match self {
@@ -159,5 +167,18 @@ mod tests {
         assert!(!Role::Explore.tools().contains(&Tool::EditFile));
         assert!(!Role::Verify.tools().contains(&Tool::WriteFile));
         assert!(Role::Implement.tools().contains(&Tool::Bash));
+        let alone: Vec<_> = Role::ALL
+            .into_iter()
+            .filter(|r| r.changes_files())
+            .collect();
+        assert_eq!(
+            alone,
+            [
+                Role::General,
+                Role::Implement,
+                Role::Formalize,
+                Role::Document
+            ]
+        );
     }
 }

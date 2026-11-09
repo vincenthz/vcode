@@ -164,6 +164,9 @@ pub struct Options {
 
 struct App {
     entries: Vec<Entry>,
+    /// the entries in the order shown: a subagent's calls after its task's
+    /// earlier ones, even while other tasks' calls come in between
+    order: Vec<usize>,
     /// the lines of each entry, for a width
     cache: Vec<Option<(usize, Vec<Line<'static>>)>>,
     input: Input,
@@ -188,7 +191,11 @@ struct App {
     progress: Option<(usize, usize)>,
     show_thinking: bool,
     verbose: bool,
+    /// the call being approved
     permission: Option<(usize, Sender<Decision>)>,
+    /// calls waiting for approval after it, of subagents working at the
+    /// same time
+    asks: VecDeque<(usize, Sender<Decision>)>,
     tools: HashMap<usize, usize>,
     queue: VecDeque<String>,
 
@@ -247,6 +254,7 @@ impl App {
     fn new(opts: Options, cmd: Sender<Cmd>, own: Sender<Msg>, stop: Arc<AtomicBool>) -> Self {
         App {
             entries: vec![Entry::Banner],
+            order: vec![0],
             cache: vec![None],
             input: Input::default(),
             cmd,
@@ -271,6 +279,7 @@ impl App {
             show_thinking: false,
             verbose: false,
             permission: None,
+            asks: VecDeque::new(),
             tools: HashMap::new(),
             queue: VecDeque::new(),
             scroll: 0,
@@ -341,9 +350,24 @@ impl App {
     }
 
     fn push(&mut self, e: Entry) -> usize {
+        let i = self.entries.len();
+        // a subagent's call goes after its task and the task's other calls
+        let at = match &e {
+            Entry::Tool(ToolRun {
+                parent: Some(p), ..
+            }) => self
+                .order
+                .iter()
+                .rposition(|&j| {
+                    j == *p || matches!(&self.entries[j], Entry::Tool(t) if t.parent == Some(*p))
+                })
+                .map_or(self.order.len(), |k| k + 1),
+            _ => self.order.len(),
+        };
         self.entries.push(e);
         self.cache.push(None);
-        self.entries.len() - 1
+        self.order.insert(at, i);
+        i
     }
 
     fn touch(&mut self, i: usize) {
@@ -471,10 +495,14 @@ impl App {
                     let _ = reply.send(Decision::Allow);
                 } else {
                     tool.state = ToolState::Asking;
-                    self.permission = Some((id, reply));
-                    self.phase = Phase::Asking;
-                    // the change to approve must be in view
-                    self.scroll = 0;
+                    if self.permission.is_some() {
+                        self.asks.push_back((id, reply));
+                    } else {
+                        self.permission = Some((id, reply));
+                        self.phase = Phase::Asking;
+                        // the change to approve must be in view
+                        self.scroll = 0;
+                    }
                 }
                 self.touch(i);
             }
@@ -600,9 +628,40 @@ impl App {
         }
     }
 
+    /// The next call waiting for approval, once the last is answered: those
+    /// the mode now allows run, the first it doesn't is asked; all are denied
+    /// when the user stopped
+    fn next_permission(&mut self) {
+        let stopped = self.stop.load(Ordering::SeqCst);
+        while let Some((id, reply)) = self.asks.pop_front() {
+            let mode = self.mode;
+            let Some((i, tool)) = self.tool(id) else {
+                let _ = reply.send(Decision::Deny(None));
+                continue;
+            };
+            if stopped {
+                let _ = reply.send(Decision::Deny(None));
+            } else if mode.allows(tool.kind()) {
+                tool.state = ToolState::Running;
+                let _ = reply.send(Decision::Allow);
+            } else {
+                self.permission = Some((id, reply));
+                self.phase = Phase::Asking;
+                self.scroll = 0;
+                self.touch(i);
+                return;
+            }
+            self.touch(i);
+        }
+        self.phase = Phase::Tool(None);
+    }
+
     fn interrupt(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some((_, reply)) = self.permission.take() {
+            let _ = reply.send(Decision::Deny(None));
+        }
+        for (_, reply) in self.asks.drain(..) {
             let _ = reply.send(Decision::Deny(None));
         }
         // queued messages come back to the input, to edit or send again
@@ -657,7 +716,7 @@ impl App {
                     }
                     let _ = reply.send(d);
                 }
-                self.phase = Phase::Tool(None);
+                self.next_permission();
             }
             return;
         }
@@ -1169,7 +1228,7 @@ impl App {
         let start = end.saturating_sub(h);
         let mut lines = Vec::with_capacity(h);
         let mut pos = 0;
-        for c in self.cache.iter().flatten() {
+        for c in self.order.iter().filter_map(|&i| self.cache[i].as_ref()) {
             let n = c.1.len();
             if pos + n > start && pos < end {
                 let a = start.saturating_sub(pos);
@@ -1795,6 +1854,93 @@ mod tests {
         app.verbose = true;
         app.touch_all();
         assert!(screen(&mut app, 60, 16).contains("Grep"));
+    }
+
+    #[test]
+    fn tasks_at_once() {
+        let (cmd, _cmds) = channel();
+        let (own, _) = channel();
+        let opts = Options {
+            cwd: "/work/proj".into(),
+            thinking: false,
+            accept_all: false,
+            mouse: false,
+        };
+        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+        app.message(Msg::Idle);
+        let sub = |task: usize, m: Msg| Msg::Sub {
+            task,
+            msg: Box::new(m),
+        };
+        let start = |id: usize, tool: Tool, title: &str| Msg::ToolStart {
+            id,
+            tool: Some(tool),
+            title: title.into(),
+            diff: None,
+        };
+        app.message(start(0, Tool::Task, "Verify run the tests"));
+        app.message(start(1, Tool::Task, "Review check the diff"));
+        // their calls come in mixed
+        app.message(sub(0, start(2, Tool::Bash, "cargo test")));
+        app.message(sub(1, start(3, Tool::Bash, "git diff")));
+        app.message(sub(0, start(4, Tool::Grep, "Grep \"fn median\" in .")));
+        let (reply0, answer0) = channel();
+        app.message(sub(
+            0,
+            Msg::Permission {
+                id: 2,
+                reply: reply0,
+            },
+        ));
+        let (reply1, answer1) = channel();
+        app.message(sub(
+            1,
+            Msg::Permission {
+                id: 3,
+                reply: reply1,
+            },
+        ));
+
+        let out = screen(&mut app, 70, 20);
+        println!("{out}");
+        // each call under its own task
+        let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s} not shown"));
+        assert!(at("Verify run the tests") < at("cargo test"));
+        assert!(at("cargo test") < at("fn median"));
+        assert!(at("fn median") < at("Review check the diff"));
+        assert!(at("Review check the diff") < at("git diff"));
+
+        // asked one after the other; allowing all commands lets the second through
+        assert!(matches!(app.permission, Some((2, _))));
+        app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(answer0.try_recv(), Ok(Decision::Allow));
+        assert_eq!(answer1.try_recv(), Ok(Decision::Allow));
+        assert!(app.permission.is_none() && app.asks.is_empty());
+
+        // an interrupt denies every call waiting
+        app.mode = Mode::Ask;
+        let (reply0, answer0) = channel();
+        let (reply1, answer1) = channel();
+        app.message(sub(0, start(5, Tool::Bash, "cargo build")));
+        app.message(sub(1, start(6, Tool::Bash, "git log")));
+        app.message(sub(
+            0,
+            Msg::Permission {
+                id: 5,
+                reply: reply0,
+            },
+        ));
+        app.message(sub(
+            1,
+            Msg::Permission {
+                id: 6,
+                reply: reply1,
+            },
+        ));
+        app.interrupt();
+        assert_eq!(answer0.try_recv(), Ok(Decision::Deny(None)));
+        assert_eq!(answer1.try_recv(), Ok(Decision::Deny(None)));
+        assert!(app.permission.is_none() && app.asks.is_empty());
     }
 
     #[test]

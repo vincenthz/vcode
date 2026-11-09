@@ -5,15 +5,20 @@
 //! runs the model, then the tools it calls, until it answers without calling
 //! any. Calls that change files or run commands ask the interface first.
 //!
-//! The `task` tool gives a task to a subagent: a second chat on the same
+//! The `task` tool gives a task to a subagent: a chat of its own on the same
 //! engine, which runs its own tool loop; its final answer is the result of
-//! the call. Its messages reach the interface wrapped in [`Msg::Sub`]. There
-//! is one GPU and biv runs one sequence at a time, so tasks run one after the
-//! other.
+//! the call. Its messages reach the interface wrapped in [`Msg::Sub`].
 //!
 //! Subagents have roles ([`Role`]: explore, implement, verify...), each with
-//! its instructions and tools. They share one chat: the system prompt of each
-//! role is processed once and saved, and a task starts from its role's.
+//! its instructions and tools. The system prompt of each role is processed
+//! once and saved, and a task's chat starts from its role's.
+//!
+//! With [`Config::parallel`] above 1 the engine is served by biv's batch
+//! scheduler ([`batch::serve`]), and the tasks called together in one turn
+//! run at the same time, each on a thread of its own: the scheduler runs
+//! their chats' tokens in shared passes, the weights read once for all of
+//! them. Only tasks whose roles don't change files run together; the others
+//! run alone.
 //!
 //! In pilot mode the main agent has no tools but `task` and `update_plan`:
 //! it directs subagents and keeps the view of the project and of the plan.
@@ -21,10 +26,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use biv::batch::{self, BatchOptions};
 use biv::chat::{Chat, ChatOptions, Event, Prefix, ReasoningEffort, ToolCall, TurnStats};
 use biv::engine::Engine;
 use biv::model::Model;
@@ -52,6 +58,9 @@ pub struct Config {
     pub lookup: usize,
     pub temperature: Option<f32>,
     pub cwd: PathBuf,
+    /// subagents working at the same time at most, their passes batched; 1
+    /// for one after the other, on the engine itself
+    pub parallel: usize,
 }
 
 /// From the interface to the agent
@@ -195,11 +204,17 @@ fn definitions(tools: impl IntoIterator<Item = Tool>) -> Vec<String> {
 }
 
 /// The options of the main conversation, from those all chats share: in
-/// pilot mode or not, with subagents or not
-fn main_options(base: &ChatOptions, cwd: &Path, pilot: bool, subagents: bool) -> ChatOptions {
+/// pilot mode or not, with subagents or not, working at the same time or not
+fn main_options(
+    base: &ChatOptions,
+    cwd: &Path,
+    pilot: bool,
+    subagents: bool,
+    parallel: bool,
+) -> ChatOptions {
     let (system, tools): (String, Vec<Tool>) = if pilot {
         (
-            crate::prompt::pilot(cwd),
+            crate::prompt::pilot(cwd, parallel),
             vec![Tool::Task, Tool::UpdatePlan],
         )
     } else {
@@ -207,7 +222,7 @@ fn main_options(base: &ChatOptions, cwd: &Path, pilot: bool, subagents: bool) ->
             .into_iter()
             .filter(|&t| t != Tool::UpdatePlan && (subagents || t != Tool::Task))
             .collect();
-        (crate::prompt::system(cwd, subagents), tools)
+        (crate::prompt::system(cwd, subagents, parallel), tools)
     };
     ChatOptions {
         system: Some(system),
@@ -244,7 +259,7 @@ fn run(
 
     let sampling = &gguf.metadata.general.sampling;
     let defaults = SamplerConfig::default();
-    let sampler = Sampler::new(SamplerConfig {
+    let sampling = SamplerConfig {
         temperature: cfg
             .temperature
             .or(sampling.temp)
@@ -256,38 +271,78 @@ fn run(
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1),
         ..defaults
-    });
+    };
 
-    let subagents = cfg.sub_context > 0;
-    if cfg.pilot && !subagents {
+    if cfg.pilot && cfg.sub_context == 0 {
         return Err("pilot mode needs subagents (--sub-ctx > 0)".into());
     }
+    let setup = Setup {
+        tok: &tok,
+        name,
+        max_context: model.cfg.context_length,
+        sampling,
+    };
+    if cfg.sub_context > 0 && cfg.parallel > 1 {
+        // the scheduler on this thread, the agent on another, with the handle
+        batch::serve(engine.as_ref(), &BatchOptions::default(), |h| {
+            session(&cfg, &h, Some(&h), setup, rx, tx, stop)
+        })
+        .map_err(|e| e.to_string())?
+    } else {
+        session(&cfg, engine.as_ref(), None, setup, rx, tx, stop)
+    }
+}
+
+/// What the session needs of the loaded model, but the engine
+struct Setup<'m> {
+    tok: &'m Tokenizer,
+    /// of the model
+    name: String,
+    /// tokens of the model's context, at most
+    max_context: usize,
+    sampling: SamplerConfig,
+}
+
+/// The agent on `engine` until the interface is gone. `shared` is the same
+/// engine when subagents can work on it at the same time.
+fn session<'m>(
+    cfg: &Config,
+    engine: &'m dyn Engine,
+    shared: Option<&'m (dyn Engine + Sync)>,
+    setup: Setup<'m>,
+    rx: Receiver<Cmd>,
+    tx: &Sender<Msg>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let tok = setup.tok;
+    let subagents = cfg.sub_context > 0;
+    let parallel = shared.is_some();
     let base = ChatOptions {
         system: None,
         thinking: cfg.thinking,
         effort: cfg.effort,
         max_tokens: cfg.max_tokens,
-        context: cfg.context.min(model.cfg.context_length),
+        context: cfg.context.min(setup.max_context),
         draft: cfg.draft,
         lookup: cfg.lookup,
         tools: Vec::new(),
         ..Default::default()
     };
     let sub_base = subagents.then(|| ChatOptions {
-        context: cfg.sub_context.min(model.cfg.context_length),
+        context: cfg.sub_context.min(setup.max_context),
         ..base.clone()
     });
-    let opts = main_options(&base, &cfg.cwd, cfg.pilot, subagents);
+    let opts = main_options(&base, &cfg.cwd, cfg.pilot, subagents, parallel);
     let context = opts.context;
-    let mut chat = Chat::new(engine.as_ref(), &tok, opts).map_err(|e| e.to_string())?;
+    let mut chat = Chat::new(engine, tok, opts).map_err(|e| e.to_string())?;
     let _ = tx.send(Msg::Ready {
-        model: name,
+        model: setup.name,
         backend: engine.description(),
         context,
     });
 
     // the system prompt and the tools, processed once for every conversation
-    status("reading the system prompt".into());
+    let _ = tx.send(Msg::Status("reading the system prompt".into()));
     let t = Instant::now();
     let prefix = chat.save().map_err(|e| e.to_string())?;
     let _ = tx.send(Msg::Context(chat.n_past()));
@@ -297,6 +352,12 @@ fn run(
         prefix.n_past(),
         t.elapsed().as_secs_f64()
     )));
+    if parallel {
+        let _ = tx.send(Msg::Info(format!(
+            "subagents: up to {} at a time, in batched passes",
+            cfg.parallel
+        )));
+    }
     let _ = tx.send(Msg::Pilot(cfg.pilot));
     let _ = tx.send(Msg::Idle);
 
@@ -310,18 +371,21 @@ fn run(
         subagents,
         carry: Vec::new(),
         worker: Worker {
-            engine: engine.as_ref(),
-            tok: &tok,
-            sampler,
+            engine,
+            shared,
+            parallel: cfg.parallel.max(1),
+            tok,
+            sampler: Sampler::new(setup.sampling.clone()),
+            sampling: setup.sampling,
             tx: tx.clone(),
             env: Env {
                 cwd: cfg.cwd.clone(),
                 stop: stop.clone(),
             },
             stop,
-            next_id: 0,
+            ids: Arc::new(AtomicUsize::new(0)),
             sub_base,
-            sub: None,
+            roles: HashMap::new(),
             task: None,
             plan: None,
             pilot: cfg.pilot,
@@ -359,9 +423,6 @@ fn run(
                 if let Some(o) = &mut agent.worker.sub_base {
                     o.thinking = on;
                 }
-                if let Some(sub) = &mut agent.worker.sub {
-                    sub.chat.opts.thinking = on;
-                }
             }
             Cmd::Pilot(on) => {
                 agent.worker.stop.store(false, Ordering::SeqCst);
@@ -389,29 +450,30 @@ struct Agent<'m> {
     worker: Worker<'m>,
 }
 
-/// The subagents' chat, kept between tasks
-struct Sub<'m> {
-    chat: Chat<'m>,
-    /// the system prompt of each role, where its tasks start
-    prefixes: HashMap<Role, Prefix>,
-}
-
 /// What runs turns and tools, for the main conversation and the subagents
 struct Worker<'m> {
     engine: &'m dyn Engine,
+    /// the same engine, for subagents working at the same time on threads of
+    /// their own; None when they work one after the other
+    shared: Option<&'m (dyn Engine + Sync)>,
+    /// subagents working at the same time at most
+    parallel: usize,
     tok: &'m Tokenizer,
+    /// what the sampler was made with, for the subagents' samplers
+    sampling: SamplerConfig,
     sampler: Sampler,
     tx: Sender<Msg>,
     env: Env,
     stop: Arc<AtomicBool>,
     /// ids of the tool calls, the subagents' included
-    next_id: usize,
+    ids: Arc<AtomicUsize>,
     /// the subagents' options but their system prompt and tools, None
-    /// without subagents
+    /// without subagents, and in a subagent
     sub_base: Option<ChatOptions>,
-    /// made for the first task
-    sub: Option<Sub<'m>>,
-    /// the call of the task being done: messages are the subagent's
+    /// the system prompt of each role, where its tasks start, each made for
+    /// the first task of its role
+    roles: HashMap<Role, Prefix>,
+    /// in a subagent, the call of its task: its messages are tagged with it
     task: Option<usize>,
     /// the pilot's overview and tasks
     plan: Option<(String, String)>,
@@ -423,6 +485,28 @@ struct Worker<'m> {
     /// command, to catch the model repeating itself
     seen: Vec<String>,
 }
+
+/// What a subagent's [`Worker`] is made of, but the engine and the
+/// tokenizer: sent to the thread of its task
+struct Seed {
+    tx: Sender<Msg>,
+    env: Env,
+    ids: Arc<AtomicUsize>,
+    sampling: SamplerConfig,
+    task: usize,
+}
+
+/// A task given, and shown: what the subagent works on
+struct Started {
+    /// of the call
+    id: usize,
+    role: Role,
+    prompt: String,
+    start: Instant,
+}
+
+/// The result of a call not run because the user interrupted
+const NOT_RUN: &str = "Not run: interrupted by the user.";
 
 /// The result of a read call made again with nothing changed since
 const REPEATED: &str = "You already made this exact call, and nothing changed since: its result is \
@@ -535,19 +619,6 @@ impl<'m> Worker<'m> {
     /// A message to the model of `chat`, then as many tool calls as it takes,
     /// `max_steps` at most: how it ended, and the number of calls
     fn converse(&mut self, chat: &mut Chat<'_>, text: String, max_steps: usize) -> (End, usize) {
-        // a subagent's conversation has its own calls; the caller's come back after
-        let seen = std::mem::take(&mut self.seen);
-        let r = self.converse_inner(chat, text, max_steps);
-        self.seen = seen;
-        r
-    }
-
-    fn converse_inner(
-        &mut self,
-        chat: &mut Chat<'_>,
-        text: String,
-        max_steps: usize,
-    ) -> (End, usize) {
         let mut input = Input::User(text);
         let mut steps = 0;
         loop {
@@ -565,14 +636,7 @@ impl<'m> Worker<'m> {
                 return (End::TooManySteps(answer), steps);
             }
             steps += stats.tool_calls.len();
-            let mut results = Vec::new();
-            for call in &stats.tool_calls {
-                if self.stopped() {
-                    results.push("Not run: interrupted by the user.".to_string());
-                    continue;
-                }
-                results.push(self.call(call));
-            }
+            let results = self.answer(&stats.tool_calls);
             if self.stopped() {
                 return (End::Stopped(Some(results)), steps);
             }
@@ -580,17 +644,56 @@ impl<'m> Worker<'m> {
         }
     }
 
-    fn next_id(&mut self) -> usize {
-        self.next_id += 1;
-        self.next_id - 1
+    /// The results of a turn's calls, in their order. Tasks called one after
+    /// the other whose roles don't change files are given together, and their
+    /// subagents work at the same time.
+    fn answer(&mut self, calls: &[ToolCall]) -> Vec<String> {
+        let mut results = Vec::with_capacity(calls.len());
+        let mut rest = calls;
+        while !rest.is_empty() {
+            if self.stopped() {
+                results.extend(rest.iter().map(|_| NOT_RUN.to_string()));
+                break;
+            }
+            let n = self.together(rest);
+            if n > 0 {
+                results.extend(self.delegate(&rest[..n]));
+            } else {
+                results.push(self.call(&rest[0]));
+            }
+            rest = &rest[n.max(1)..];
+        }
+        results
+    }
+
+    /// How many of the first `calls` are tasks to give together: 0 if the
+    /// first isn't a task for a subagent, 1 if it is one to give alone
+    fn together(&self, calls: &[ToolCall]) -> usize {
+        let is_task = |c: &ToolCall| Tool::from_name(&c.name) == Some(Tool::Task);
+        if self.sub_base.is_none() || !is_task(&calls[0]) {
+            return 0;
+        }
+        if self.shared.is_none() {
+            return 1;
+        }
+        let reads_only = |c: &ToolCall| {
+            is_task(c) && tools::task_request(c).is_ok_and(|(role, ..)| !role.changes_files())
+        };
+        calls
+            .iter()
+            .take(self.parallel)
+            .take_while(|c| reads_only(c))
+            .count()
+            .max(1)
+    }
+
+    fn next_id(&self) -> usize {
+        self.ids.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Run a call, after asking the user if it needs to: the result for the model
     fn call(&mut self, call: &ToolCall) -> String {
         let tool = Tool::from_name(&call.name);
-        if tool == Some(Tool::Task) && self.task.is_none() && self.sub_base.is_some() {
-            return self.delegate(call);
-        }
         if tool == Some(Tool::UpdatePlan) && self.task.is_none() {
             return match tools::plan_request(call) {
                 Ok((overview, tasks)) => {
@@ -672,8 +775,51 @@ impl<'m> Worker<'m> {
         out.text
     }
 
-    /// A call of `task`: a subagent of its role does it, its report is the result
-    fn delegate(&mut self, call: &ToolCall) -> String {
+    /// Calls of `task`, each done by a subagent of its role, at the same time
+    /// when there are several: their reports are the results
+    fn delegate(&mut self, calls: &[ToolCall]) -> Vec<String> {
+        let mut results: Vec<Option<String>> = vec![None; calls.len()];
+        let mut ready = Vec::new();
+        let mut any = false;
+        for (i, call) in calls.iter().enumerate() {
+            let task = match self.start_task(call) {
+                Ok(t) => t,
+                Err(result) => {
+                    results[i] = Some(result);
+                    continue;
+                }
+            };
+            any = true;
+            // the system prompt of each role is processed before the tasks start
+            match self.role_prefix(task.role, task.id) {
+                Ok(()) => ready.push((i, task)),
+                Err(e) => results[i] = Some(self.finish_task(&task, End::Failed(e), 0).1),
+            }
+        }
+        let ends = self.run_tasks(&ready);
+        let mut implemented = false;
+        for ((i, task), (end, steps)) in ready.iter().zip(ends) {
+            let (ok, text) = self.finish_task(task, end, steps);
+            implemented |= ok && task.role == Role::Implement;
+            results[*i] = Some(text);
+        }
+        // the subagents may have changed what the agent read
+        if any {
+            self.seen.clear();
+        }
+        let mut results: Vec<String> = results.into_iter().map(Option::unwrap_or_default).collect();
+        if self.pilot
+            && any
+            && let Some(last) = results.last_mut()
+        {
+            *last = self.remind(std::mem::take(last), implemented);
+        }
+        results
+    }
+
+    /// A call of `task` shown, and read: the task, or the result of the call
+    /// when it is not one
+    fn start_task(&mut self, call: &ToolCall) -> Result<Started, String> {
         let id = self.next_id();
         let (role, description, prompt) = match tools::task_request(call) {
             Ok(r) => r,
@@ -689,7 +835,7 @@ impl<'m> Worker<'m> {
                     ok: false,
                     summary: e.clone(),
                 });
-                return format!("Error: {e}");
+                return Err(format!("Error: {e}"));
             }
         };
         self.send(Msg::ToolStart {
@@ -698,25 +844,118 @@ impl<'m> Worker<'m> {
             title: format!("{} {description}", role.label()),
             diff: None,
         });
-        let start = Instant::now();
-        self.task = Some(id);
-        let result = self.subagent(role).map(|mut sub| {
-            let outcome = match sub.chat.restore(&sub.prefixes[&role]) {
-                Ok(()) => self.converse(&mut sub.chat, prompt, role.max_steps()),
-                Err(e) => (End::Failed(e.to_string()), 0),
-            };
-            self.sub = Some(sub);
-            outcome
-        });
-        self.task = None;
-        let (end, steps) = match result {
-            Ok(r) => r,
-            Err(e) => (End::Failed(e), 0),
+        Ok(Started {
+            id,
+            role,
+            prompt,
+            start: Instant::now(),
+        })
+    }
+
+    /// The options of a chat of `role`'s subagents
+    fn task_options(&self, role: Role) -> Result<ChatOptions, String> {
+        let base = self.sub_base.clone().ok_or("no subagents")?;
+        Ok(ChatOptions {
+            system: Some(crate::prompt::subagent(&self.env.cwd, role)),
+            tools: definitions(role.tools()),
+            ..base
+        })
+    }
+
+    /// The system prompt of `role` processed and saved, if this is its first
+    /// task; the news goes to the task of call `id`
+    fn role_prefix(&mut self, role: Role, id: usize) -> Result<(), String> {
+        if self.roles.contains_key(&role) {
+            return Ok(());
+        }
+        let t = Instant::now();
+        let mut chat = Chat::new(self.engine, self.tok, self.task_options(role)?)
+            .map_err(|e| e.to_string())?;
+        let prefix = chat.save().map_err(|e| e.to_string())?;
+        let memory = chat.memory().allocated() as f64 / 1e9;
+        let _ = self.tx.send(Self::tagged(
+            Some(id),
+            Msg::Info(format!(
+                "{} subagent ready: system prompt {} tokens in {:.1}s, session {memory:.1} GB",
+                role.name(),
+                prefix.n_past(),
+                t.elapsed().as_secs_f64()
+            )),
+        ));
+        self.roles.insert(role, prefix);
+        Ok(())
+    }
+
+    /// What the worker of the subagent doing the task of call `task` is made of
+    fn seed(&self, task: usize) -> Seed {
+        Seed {
+            tx: self.tx.clone(),
+            env: Env {
+                cwd: self.env.cwd.clone(),
+                stop: self.stop.clone(),
+            },
+            ids: self.ids.clone(),
+            sampling: SamplerConfig {
+                // each subagent samples on its own
+                seed: self.sampling.seed ^ (task as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                ..self.sampling.clone()
+            },
+            task,
+        }
+    }
+
+    /// The tasks done, each on a chat of its own from its role's prefix: on
+    /// threads of their own when there are several and the engine is shared,
+    /// one after the other otherwise
+    fn run_tasks(&self, tasks: &[(usize, Started)]) -> Vec<(End, usize)> {
+        let jobs: Vec<_> = tasks
+            .iter()
+            .map(|(_, t)| {
+                let opts = self
+                    .task_options(t.role)
+                    .expect("tasks only with subagents");
+                (self.seed(t.id), opts, &self.roles[&t.role], t)
+            })
+            .collect();
+        let shared = self.shared.filter(|_| jobs.len() > 1);
+        let Some(engine) = shared else {
+            return jobs
+                .into_iter()
+                .map(|(seed, opts, prefix, t)| {
+                    Worker::of_task(self.engine, self.tok, seed).work(opts, prefix, t)
+                })
+                .collect();
         };
+        let tok = self.tok;
+        std::thread::scope(|s| {
+            let threads: Vec<_> = jobs
+                .into_iter()
+                .map(|(seed, opts, prefix, t)| {
+                    std::thread::Builder::new()
+                        .name(format!("task {}", t.id))
+                        .spawn_scoped(s, move || {
+                            Worker::of_task(engine, tok, seed).work(opts, prefix, t)
+                        })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| match t.map(|t| t.join()) {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) => (End::Failed("the subagent crashed".into()), 0),
+                    Err(e) => (End::Failed(format!("no thread for the subagent: {e}")), 0),
+                })
+                .collect()
+        })
+    }
+
+    /// The task's end shown, and its report: whether it succeeded, and the
+    /// result of its call
+    fn finish_task(&self, task: &Started, end: End, steps: usize) -> (bool, String) {
         let took = format!(
             "{steps} tool call{} · {:.0}s",
             if steps == 1 { "" } else { "s" },
-            start.elapsed().as_secs_f64()
+            task.start.elapsed().as_secs_f64()
         );
         let (ok, summary, text) = match end {
             End::Answered(a) if !a.trim().is_empty() => {
@@ -746,13 +985,19 @@ impl<'m> Worker<'m> {
                 ),
             ),
         };
-        self.send(Msg::ToolDone { id, ok, summary });
-        if !self.pilot {
-            return text;
-        }
-        // the pilot's instructions, where it decides what to do next
+        self.send(Msg::ToolDone {
+            id: task.id,
+            ok,
+            summary,
+        });
+        (ok, text)
+    }
+
+    /// The pilot's instructions after tasks' reports, where it decides what to
+    /// do next
+    fn remind(&mut self, text: String, implemented: bool) -> String {
         let mut reminders = Vec::new();
-        if role == Role::Implement && ok {
+        if implemented {
             reminders.push(
                 "a change is done only once a verify task has passed: give it one, saying what to check",
             );
@@ -767,44 +1012,39 @@ impl<'m> Worker<'m> {
         }
     }
 
-    /// The subagents' chat, made on the first task and taken while one
-    /// works, with the system prompt of `role` saved
-    fn subagent(&mut self, role: Role) -> Result<Sub<'m>, String> {
-        let base = self.sub_base.clone().ok_or("no subagents")?;
-        let opts = ChatOptions {
-            system: Some(crate::prompt::subagent(&self.env.cwd, role)),
-            tools: definitions(role.tools()),
-            ..base
-        };
-        let mut sub = match self.sub.take() {
-            Some(sub) => sub,
-            None => Sub {
-                chat: Chat::new(self.engine, self.tok, opts.clone()).map_err(|e| e.to_string())?,
-                prefixes: HashMap::new(),
-            },
-        };
-        if !sub.prefixes.contains_key(&role) {
-            let t = Instant::now();
-            // a fresh sequence, whose system block is this role's
-            sub.chat.opts = opts;
-            let made = sub.chat.reset().and_then(|()| sub.chat.save());
-            let prefix = match made {
-                Ok(p) => p,
-                Err(e) => {
-                    self.sub = Some(sub);
-                    return Err(e.to_string());
-                }
-            };
-            let memory = sub.chat.memory().allocated() as f64 / 1e9;
-            self.info(format!(
-                "{} subagent ready: system prompt {} tokens in {:.1}s, session {memory:.1} GB",
-                role.name(),
-                prefix.n_past(),
-                t.elapsed().as_secs_f64()
-            ));
-            sub.prefixes.insert(role, prefix);
+    /// The worker of a subagent, which gives no tasks
+    fn of_task(engine: &'m dyn Engine, tok: &'m Tokenizer, seed: Seed) -> Worker<'m> {
+        Worker {
+            engine,
+            shared: None,
+            parallel: 1,
+            tok,
+            sampler: Sampler::new(seed.sampling.clone()),
+            sampling: seed.sampling,
+            tx: seed.tx,
+            stop: seed.env.stop.clone(),
+            env: seed.env,
+            ids: seed.ids,
+            sub_base: None,
+            roles: HashMap::new(),
+            task: Some(seed.task),
+            plan: None,
+            pilot: false,
+            plan_fresh: false,
+            seen: Vec::new(),
         }
-        Ok(sub)
+    }
+
+    /// The subagent's work on `task`, in a chat started from its role's prefix
+    fn work(mut self, opts: ChatOptions, prefix: &Prefix, task: &Started) -> (End, usize) {
+        let mut chat = match Chat::new(self.engine, self.tok, opts) {
+            Ok(c) => c,
+            Err(e) => return (End::Failed(e.to_string()), 0),
+        };
+        if let Err(e) = chat.restore(prefix) {
+            return (End::Failed(e.to_string()), 0);
+        }
+        self.converse(&mut chat, task.prompt.clone(), task.role.max_steps())
     }
 }
 
@@ -842,16 +1082,18 @@ impl Agent<'_> {
             return;
         }
         let cwd = self.worker.env.cwd.clone();
+        let parallel = self.worker.shared.is_some();
         self.carry.clear();
         if pilot != self.pilot {
-            self.chat.opts = main_options(&self.base, &cwd, pilot, self.subagents);
+            self.chat.opts = main_options(&self.base, &cwd, pilot, self.subagents, parallel);
             if self.prefixes[pilot as usize].is_none() {
                 self.worker.info("reading the system prompt".into());
                 match self.chat.reset().and_then(|()| self.chat.save()) {
                     Ok(p) => self.prefixes[pilot as usize] = Some(p),
                     Err(e) => {
                         self.worker.send(Msg::Error(format!("switching mode: {e}")));
-                        self.chat.opts = main_options(&self.base, &cwd, self.pilot, self.subagents);
+                        self.chat.opts =
+                            main_options(&self.base, &cwd, self.pilot, self.subagents, parallel);
                         self.clear();
                         return;
                     }

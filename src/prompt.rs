@@ -40,6 +40,10 @@ be complete, since it knows nothing of this conversation: the question, what you
 and what to report (paths, line numbers, short excerpts). Read a file yourself only to change it \
 or to check a detail of the report.";
 
+/// In the agent's instructions when its subagents work at the same time
+const TASK_PARALLEL: &str = " Explore, verify and review tasks called together, in one answer, run \
+at the same time: give independent investigations together rather than one after the other.";
+
 const SUBAGENT: &str = "\
 You are a subagent of vcode, a coding agent running in the user's terminal, on their machine. \
 The main agent gave you a task. Do it on your own with the tools: nobody will answer questions.
@@ -76,7 +80,7 @@ reports, not the code.
 - general: anything else.
 They know nothing of this conversation, and nothing of each other's work but what you tell \
 them: every prompt must be complete: the goal, the files and facts you know from earlier \
-reports, constraints and decisions, and what to report. Tasks run one at a time.
+reports, constraints and decisions, and what to report. {PARALLEL}
 
 # How to work
 1. Understand: unless the request is trivial, start with one or a few explore tasks on the parts \
@@ -99,15 +103,28 @@ answering without a tool call ends your turn.
 Don't have subagents commit unless the user asked.
 - Keep your own messages short. Use Markdown.";
 
+/// How the pilot's tasks run, with subagents working at the same time or not
+const PILOT_ONE: &str = "Tasks run one at a time.";
+const PILOT_PARALLEL: &str = "Explore, verify and review tasks called together, in one answer, run at \
+the same time: give independent ones together (explore tasks on different parts of the project, a \
+verify and a review of the same change), each with its own complete prompt. Tasks that can change \
+files (implement, formalize, document, general) run alone, one at a time.";
+
 /// Files read into the system prompt, the first found in the working directory
 const INSTRUCTION_FILES: [&str; 3] = ["AGENTS.md", "VCODE.md", "CLAUDE.md"];
 
 /// Bytes of the project's instructions kept at most
 const MAX_INSTRUCTIONS: usize = 16_000;
 
-/// The agent's, which may give tasks to subagents
-pub fn system(cwd: &Path, subagents: bool) -> String {
-    let mut s = BASE.replace("{TASK}", if subagents { TASK } else { "" });
+/// The agent's, which may give tasks to subagents, several at the same
+/// time if `parallel`
+pub fn system(cwd: &Path, subagents: bool, parallel: bool) -> String {
+    let task = match (subagents, parallel) {
+        (false, _) => String::new(),
+        (true, false) => TASK.to_string(),
+        (true, true) => format!("{TASK}{TASK_PARALLEL}"),
+    };
+    let mut s = BASE.replace("{TASK}", &task);
     environment(cwd, &mut s);
     s
 }
@@ -121,9 +138,13 @@ pub fn subagent(cwd: &Path, role: Role) -> String {
     s
 }
 
-/// The pilot's: an agent that only directs subagents
-pub fn pilot(cwd: &Path) -> String {
-    let mut s = String::from(PILOT);
+/// The pilot's: an agent that only directs subagents, several at the same
+/// time if `parallel`
+pub fn pilot(cwd: &Path, parallel: bool) -> String {
+    let mut s = PILOT.replace(
+        "{PARALLEL}",
+        if parallel { PILOT_PARALLEL } else { PILOT_ONE },
+    );
     environment(cwd, &mut s);
     s
 }

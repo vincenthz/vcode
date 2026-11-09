@@ -74,13 +74,33 @@ Each kind of subagent has its own instructions and tools:
 | `document` | read, search, edit | writes or updates documentation |
 | `general` | all | anything else |
 
-They share one chat on the engine: the system prompt of each kind is processed
-the first time it is used and saved, and every task restores its kind's (the
-session is 1.5 GB with the 35B-A3B at 32k; a saved system prompt is a copy of
-the recurrent states plus its tokens' KV cache). biv runs one sequence at a
-time on the GPU, so tasks run one after the other.
+The system prompt of each kind is processed the first time it is used and
+saved, and every task gets a chat of its own that starts from its kind's (a
+saved system prompt is a copy of the recurrent states plus its tokens' KV
+cache; a task's session is 1.5 GB with the 35B-A3B at 32k).
 
-Outside pilot mode the agent has every tool and delegates when it chooses to.
+### Tasks at the same time
+
+Tasks the model calls together, in one answer, run at the same time when their
+kinds don't change files (`explore`, `verify`, `review`): up to `--parallel` of
+them (4 by default), each subagent on a thread of its own. The engine is then
+served by biv's [continuous batching](https://github.com/vincenthz/biv#batching)
+scheduler, whose passes take the tokens of every chat ready for one, so the
+weights are read once for all of them. Tasks that can change files
+(`implement`, `formalize`, `document`, `general`) run alone, so two subagents
+never edit the tree at the same time. The calls of each task show under it,
+and approvals they ask for at the same time are asked one after the other.
+
+Two explore tasks on the 35B-A3B (M2 Max) answer at about 50 tok/s each, about
+100 tok/s together against 115 for one alone. Each task running needs its own
+session: 4 at 32k are about 6 GB on top of the model. MTP drafts gain less in a
+batch (see biv's numbers): with many tasks at once, `-d 1` can be faster.
+`--parallel 1` runs tasks one after the other on the engine itself, without the
+scheduler.
+
+Outside pilot mode the agent has every tool and delegates when it chooses to,
+and is told that explore, verify and review tasks called together run at the
+same time.
 Qwen3.6 35B-A3B does when asked ("use a subagent to…"), but seldom on its own:
 given an open question over several files, it reads them itself.
 
@@ -91,8 +111,8 @@ has no tools but `task` and `update_plan`: it can't read or change files, so
 everything goes through subagents, and its context holds only the overall
 view: the request, its overview of the project, the plan, and the reports. Its
 instructions are to explore first, record a plan, then take the tasks one at a
-time: implement, verify (and review when it matters), a new implement task
-with what failed, formalize when the requirements are subtle, document when
+time: implement, verify (and review when it matters: the two together, at
+the same time), a new implement task with what failed, formalize when the requirements are subtle, document when
 users or interfaces change, and a summary at the end. A change is done when a
 verify task passed.
 
@@ -118,7 +138,7 @@ summary of it, which also happens by itself at 80% of the context), `/pilot`,
 | file | role |
 |---|---|
 | `src/main.rs` | options, the headless mode (`-p`) |
-| `src/agent.rs` | the agent thread: owns the model and the chats (main, subagent), runs the tool loops, compaction |
+| `src/agent.rs` | the agent thread: owns the model and the chats (main, subagents), the batch scheduler, runs the tool loops and the subagents' threads, compaction |
 | `src/roles.rs` | the kinds of subagents: instructions, tools |
 | `src/tools.rs` | tool definitions (as the chat template's `tojson` writes them), planning (argument checks, diffs) and running |
 | `src/prompt.rs` | the system prompts: agent, pilot, subagents |
@@ -128,4 +148,7 @@ summary of it, which also happens by itself at 80% of the context), `/pilot`,
 
 biv's engine is not `Send`, so the agent thread loads the model itself and
 the two threads only exchange messages: `Cmd` to the agent, `Msg` back, and a
-reply channel in each approval request.
+reply channel in each approval request. With `--parallel` above 1 the agent
+thread runs biv's batch scheduler, and the agent itself runs on a thread of
+its own with the scheduler's handle, an engine that can be shared: the
+subagents working at the same time make their chats on it from their threads.
