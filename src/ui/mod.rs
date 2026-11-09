@@ -312,26 +312,35 @@ impl App {
                 dirty = false;
             }
             if event::poll(Duration::from_millis(30))? {
-                // everything pending, then one draw
+                // everything pending, then one draw; never a read without a
+                // poll before it, which would wait for the next event (a mouse
+                // move, a focus change) with the interface frozen until then
                 loop {
                     match event::read()? {
-                        TermEvent::Key(k) => self.key(k),
+                        TermEvent::Key(k) => {
+                            self.key(k);
+                            dirty = true;
+                        }
                         TermEvent::Paste(s) => {
                             if self.permission.is_none() {
                                 self.input.insert(&s);
                             }
+                            dirty = true;
                         }
                         TermEvent::Mouse(m) => match m.kind {
-                            MouseEventKind::ScrollUp => self.scroll += 3,
-                            MouseEventKind::ScrollDown => {
-                                self.scroll = self.scroll.saturating_sub(3)
+                            MouseEventKind::ScrollUp => {
+                                self.scroll += 3;
+                                dirty = true;
                             }
-                            _ => continue,
+                            MouseEventKind::ScrollDown => {
+                                self.scroll = self.scroll.saturating_sub(3);
+                                dirty = true;
+                            }
+                            _ => {}
                         },
-                        TermEvent::Resize(..) => {}
-                        _ => continue,
+                        TermEvent::Resize(..) => dirty = true,
+                        _ => {}
                     }
-                    dirty = true;
                     if !event::poll(Duration::ZERO)? {
                         break;
                     }
