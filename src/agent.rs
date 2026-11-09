@@ -39,6 +39,7 @@ use biv::tokenizer::Tokenizer;
 
 use crate::roles::Role;
 use crate::tools::{self, DiffLine, Env, Kind, Tool};
+use crate::trace::{self, Stream, Tag};
 
 /// What the agent is started with
 #[derive(Clone)]
@@ -407,6 +408,7 @@ fn session<'m>(
             pilot: cfg.pilot,
             plan_fresh: false,
             seen: Vec::new(),
+            trace: Tag::new(0),
         },
     };
     for cmd in rx {
@@ -506,6 +508,8 @@ struct Worker<'m> {
     /// the read calls of the current conversation since its last edit or
     /// command, to catch the model repeating itself
     seen: Vec<String>,
+    /// the agent's number and its prompts so far, in the trace
+    trace: Tag,
 }
 
 /// What a subagent's [`Worker`] is made of, but the engine and the
@@ -516,6 +520,8 @@ struct Seed {
     ids: Arc<AtomicUsize>,
     sampling: SamplerConfig,
     task: usize,
+    /// the subagent's number in the trace
+    agent: usize,
 }
 
 /// A task given, and shown: what the subagent works on
@@ -525,6 +531,8 @@ struct Started {
     role: Role,
     prompt: String,
     start: Instant,
+    /// the subagent's number in the trace
+    agent: usize,
 }
 
 /// The result of a call not run because the user interrupted
@@ -582,6 +590,16 @@ impl<'m> Worker<'m> {
         input: Input,
     ) -> Result<(TurnStats, String), String> {
         self.send(Msg::Generating);
+        self.trace.prompt += 1;
+        let tag = self.trace;
+        match &input {
+            Input::User(text) => trace::event(tag, "prompt", text),
+            Input::Tools(results) => trace::event(
+                tag,
+                &format!("prompt: the results of {} call(s)", results.len()),
+                "",
+            ),
+        }
         let tx = self.tx.clone();
         let task = self.task;
         let stop = self.stop.clone();
@@ -594,9 +612,13 @@ impl<'m> Worker<'m> {
                     t1 = Some(Instant::now());
                     Msg::PromptDone
                 }
-                Event::Thinking(t) => Msg::Thinking(t.to_string()),
+                Event::Thinking(t) => {
+                    trace::token(tag, Stream::Thinking, t);
+                    Msg::Thinking(t.to_string())
+                }
                 Event::ThinkingDone => Msg::ThinkingDone,
                 Event::Answer(t) => {
+                    trace::token(tag, Stream::Answer, t);
                     answer.push_str(t);
                     Msg::Answer(t.to_string())
                 }
@@ -615,24 +637,40 @@ impl<'m> Worker<'m> {
         if self.task.is_none() {
             self.send(Msg::Context(chat.n_past()));
         }
-        let stats = result.map_err(|e| e.to_string())?;
+        let stats = result.map_err(|e| {
+            let e = e.to_string();
+            trace::event(tag, "turn failed", &e);
+            e
+        })?;
         let t1 = t1.unwrap_or(t0);
         let rate = |n: usize, s: f64| n as f64 / s.max(1e-6);
         let prompt_s = (t1 - t0).as_secs_f64();
         let gen_s = t1.elapsed().as_secs_f64();
+        let summary = format!(
+            "prompt {} tok {:.0} tok/s · answer {} tok {:.1} tok/s{}",
+            stats.prompt_tokens,
+            rate(stats.prompt_tokens, prompt_s),
+            stats.gen_tokens,
+            rate(stats.gen_tokens, gen_s),
+            if stats.truncated && !self.stopped() {
+                " · truncated"
+            } else {
+                ""
+            }
+        );
+        if trace::enabled() {
+            let what = format!(
+                "turn done{}: {} call(s)",
+                if self.stopped() { ", interrupted" } else { "" },
+                stats.tool_calls.len()
+            );
+            trace::event(tag, &what, &summary);
+            for c in &stats.tool_calls {
+                trace::event(tag, &format!("call {}", c.name), &trace::arguments(&c.arguments));
+            }
+        }
         self.send(Msg::TurnDone {
-            stats: format!(
-                "prompt {} tok {:.0} tok/s · answer {} tok {:.1} tok/s{}",
-                stats.prompt_tokens,
-                rate(stats.prompt_tokens, prompt_s),
-                stats.gen_tokens,
-                rate(stats.gen_tokens, gen_s),
-                if stats.truncated && !self.stopped() {
-                    " · truncated"
-                } else {
-                    ""
-                }
-            ),
+            stats: summary,
             interrupted: self.stopped(),
         });
         Ok((stats, answer))
@@ -717,6 +755,7 @@ impl<'m> Worker<'m> {
     fn call(&mut self, call: &ToolCall) -> String {
         let tool = Tool::from_name(&call.name);
         if tool == Some(Tool::UpdatePlan) && self.task.is_none() {
+            trace::event(self.trace, "run update_plan", "");
             return match tools::plan_request(call) {
                 Ok((overview, tasks)) => {
                     self.plan_fresh = true;
@@ -733,7 +772,10 @@ impl<'m> Worker<'m> {
         // the same read again, with no edit nor command since, is the model looping
         let key = format!("{}{:?}", call.name, call.arguments);
         match tool.map(Tool::kind) {
-            Some(Kind::Read) if self.seen.contains(&key) => return REPEATED.into(),
+            Some(Kind::Read) if self.seen.contains(&key) => {
+                trace::event(self.trace, &format!("repeated {}: not run", call.name), "");
+                return REPEATED.into();
+            }
             Some(Kind::Read) => self.seen.push(key),
             Some(Kind::Edit | Kind::Exec) => self.seen.clear(),
             _ => {}
@@ -742,6 +784,7 @@ impl<'m> Worker<'m> {
         let plan = match self.env.plan(call) {
             Ok(p) => p,
             Err(e) => {
+                trace::event(self.trace, &format!("result #{id} {}: error", call.name), &e);
                 self.send(Msg::ToolStart {
                     id,
                     tool,
@@ -756,6 +799,11 @@ impl<'m> Worker<'m> {
                 return format!("Error: {e}");
             }
         };
+        trace::event(
+            self.trace,
+            &format!("run #{id} {}: {}", plan.tool.name(), plan.title),
+            "",
+        );
         self.send(Msg::ToolStart {
             id,
             tool: Some(plan.tool),
@@ -765,7 +813,9 @@ impl<'m> Worker<'m> {
         if matches!(plan.tool.kind(), Kind::Edit | Kind::Exec) {
             let (reply, answer) = channel();
             self.send(Msg::Permission { id, reply });
-            match answer.recv().unwrap_or(Decision::Deny(None)) {
+            let decision = answer.recv().unwrap_or(Decision::Deny(None));
+            trace::event(self.trace, &format!("permission #{id}: {decision:?}"), "");
+            match decision {
                 Decision::Allow => {}
                 Decision::Deny(why) => {
                     self.send(Msg::ToolDone {
@@ -789,6 +839,15 @@ impl<'m> Worker<'m> {
             };
             let _ = tx.send(Self::tagged(task, m));
         });
+        trace::event(
+            self.trace,
+            &format!(
+                "result #{id} {}: {}",
+                if out.ok { "ok" } else { "failed" },
+                out.summary
+            ),
+            &out.text,
+        );
         self.send(Msg::ToolDone {
             id,
             ok: out.ok,
@@ -846,6 +905,7 @@ impl<'m> Worker<'m> {
         let (role, description, prompt) = match tools::task_request(call) {
             Ok(r) => r,
             Err(e) => {
+                trace::event(self.trace, &format!("task #{id}: error"), &e);
                 self.send(Msg::ToolStart {
                     id,
                     tool: Some(Tool::Task),
@@ -860,6 +920,12 @@ impl<'m> Worker<'m> {
                 return Err(format!("Error: {e}"));
             }
         };
+        let agent = trace::next_agent();
+        trace::event(
+            self.trace,
+            &format!("task #{id} to agent {agent} ({}): {description}", role.name()),
+            &prompt,
+        );
         self.send(Msg::ToolStart {
             id,
             tool: Some(Tool::Task),
@@ -871,6 +937,7 @@ impl<'m> Worker<'m> {
             role,
             prompt,
             start: Instant::now(),
+            agent,
         })
     }
 
@@ -909,7 +976,7 @@ impl<'m> Worker<'m> {
     }
 
     /// What the worker of the subagent doing the task of call `task` is made of
-    fn seed(&self, task: usize) -> Seed {
+    fn seed(&self, task: usize, agent: usize) -> Seed {
         Seed {
             tx: self.tx.clone(),
             env: Env {
@@ -923,6 +990,7 @@ impl<'m> Worker<'m> {
                 ..self.sampling.clone()
             },
             task,
+            agent,
         }
     }
 
@@ -936,7 +1004,7 @@ impl<'m> Worker<'m> {
                 let opts = self
                     .task_options(t.role)
                     .expect("tasks only with subagents");
-                (self.seed(t.id), opts, &self.roles[&t.role], t)
+                (self.seed(t.id, t.agent), opts, &self.roles[&t.role], t)
             })
             .collect();
         let shared = self.shared.filter(|_| jobs.len() > 1);
@@ -1007,6 +1075,16 @@ impl<'m> Worker<'m> {
                 ),
             ),
         };
+        trace::event(
+            self.trace,
+            &format!(
+                "report #{} of agent {}{}: {summary}",
+                task.id,
+                task.agent,
+                if ok { "" } else { ", failed" }
+            ),
+            &text,
+        );
         self.send(Msg::ToolDone {
             id: task.id,
             ok,
@@ -1054,6 +1132,7 @@ impl<'m> Worker<'m> {
             pilot: false,
             plan_fresh: false,
             seen: Vec::new(),
+            trace: Tag::new(seed.agent),
         }
     }
 
@@ -1066,6 +1145,11 @@ impl<'m> Worker<'m> {
         if let Err(e) = chat.restore(prefix) {
             return (End::Failed(e.to_string()), 0);
         }
+        trace::event(
+            self.trace,
+            &format!("agent {} starts: task #{} ({})", self.trace.agent, task.id, task.role.name()),
+            "",
+        );
         self.converse(&mut chat, task.prompt.clone(), task.role.max_steps())
     }
 }
@@ -1178,6 +1262,7 @@ impl Agent<'_> {
     }
 
     fn clear(&mut self) {
+        trace::event(self.worker.trace, "conversation cleared", "");
         self.worker.plan = None;
         let prefix = self.prefixes[self.pilot as usize]
             .as_ref()
@@ -1268,6 +1353,9 @@ impl Agent<'_> {
         self.chat.opts.thinking = false;
         self.chat.opts.max_tokens = 2048;
         self.worker.info("summarizing the conversation".into());
+        self.worker.trace.prompt += 1;
+        let tag = self.worker.trace;
+        trace::event(tag, "prompt: compact", COMPACT_PROMPT);
         let mut summary = String::new();
         let tx = self.worker.tx.clone();
         let stop = self.worker.stop.clone();
@@ -1276,6 +1364,7 @@ impl Agent<'_> {
             &mut self.worker.sampler,
             |ev| {
                 if let Event::Answer(t) = ev {
+                    trace::token(tag, Stream::Answer, t);
                     summary.push_str(t);
                     let _ = tx.send(Msg::Answer(t.to_string()));
                 }
@@ -1285,6 +1374,11 @@ impl Agent<'_> {
         self.chat.opts.thinking = thinking;
         self.chat.opts.max_tokens = max_tokens;
         let stopped = self.worker.stopped();
+        trace::event(
+            tag,
+            &format!("compact done{}", if stopped { ", interrupted" } else { "" }),
+            "",
+        );
         self.worker.send(Msg::TurnDone {
             stats: String::new(),
             interrupted: stopped,

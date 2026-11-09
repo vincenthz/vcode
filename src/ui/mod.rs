@@ -29,7 +29,7 @@ use crate::tools::{DiffLine, Kind, Tool, clip};
 use input::Input;
 use text::{markdown, width, wrap, wrap_plain};
 
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 11] = [
     ("/help", "keys and commands"),
     ("/clear", "start a new conversation"),
     (
@@ -46,6 +46,10 @@ const COMMANDS: [(&str, &str); 10] = [
     (
         "/context",
         "show the context use, or resize it: /context 128k, /context sub 64k",
+    ),
+    (
+        "/debug",
+        "trace prompts, tokens and tool calls to a file: /debug <file>, /debug off",
     ),
     ("/quit", "exit"),
     ("/exit", "exit"),
@@ -981,8 +985,36 @@ impl App {
                     },
                 }
             }
+            "/debug" => self.debug(line[name.len()..].trim()),
             _ => self.notify(format!("unknown command {name}, /help lists them")),
         }
+    }
+
+    /// `/debug`: the trace's state; `/debug <file>` traces to the file,
+    /// relative to the working directory; `/debug off` stops tracing
+    fn debug(&mut self, arg: &str) {
+        let msg = match arg {
+            "" => match crate::trace::path() {
+                Some(p) => format!("tracing to {}; /debug off to stop", p.display()),
+                None => "not tracing; /debug <file> to trace to a file".into(),
+            },
+            "off" | "stop" => match crate::trace::stop() {
+                Some(p) => format!("tracing stopped; the trace is in {}", p.display()),
+                None => "not tracing".into(),
+            },
+            file => {
+                let path = match file.strip_prefix("~/") {
+                    Some(rest) => std::env::var_os("HOME")
+                        .map_or_else(|| PathBuf::from(file), |h| PathBuf::from(h).join(rest)),
+                    None => self.cwd.join(file),
+                };
+                match crate::trace::start(&path) {
+                    Ok(()) => format!("tracing to {}; /debug off to stop", path.display()),
+                    Err(e) => format!("can't trace: {e}"),
+                }
+            }
+        };
+        self.push(Entry::Info(msg));
     }
 
     /// A `!` command: run here, its output kept for the next message

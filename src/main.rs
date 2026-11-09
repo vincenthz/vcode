@@ -4,6 +4,7 @@ mod agent;
 mod prompt;
 mod roles;
 mod tools;
+mod trace;
 mod ui;
 
 use std::io::Write;
@@ -58,6 +59,8 @@ usage: vcode [options] [directory]
                            speeds up edits that copy code, 0 to disable [default: 7]
       --temp <f>           sampling temperature [default: the model's]
       --no-mouse           leave the mouse to the terminal (text selection)
+      --trace <file>       trace the prompts, tokens and tool calls of the
+                           agents to a file (also /debug <file>, /debug off)
   -h, --help
 
 The directory, the current one by default, is where the agent works. Its
@@ -68,6 +71,7 @@ struct Args {
     prompt: Option<String>,
     yolo: bool,
     mouse: bool,
+    trace: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -90,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
         prompt: None,
         yolo: false,
         mouse: true,
+        trace: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -126,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
             "-l" | "--lookup" => a.cfg.lookup = num(&flag, val()?)?,
             "--temp" => a.cfg.temperature = Some(num(&flag, val()?)?),
             "--no-mouse" => a.mouse = false,
+            "--trace" => a.trace = Some(PathBuf::from(val()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -154,13 +160,21 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(path) = &args.trace
+        && let Err(e) = trace::start(path)
+    {
+        eprintln!("error: --trace {e}");
+        std::process::exit(2);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let (cmd_tx, cmd_rx) = channel();
     let (msg_tx, msg_rx) = channel();
     agent::spawn(args.cfg.clone(), cmd_rx, msg_tx.clone(), stop.clone());
 
     if let Some(prompt) = args.prompt {
-        std::process::exit(headless(&prompt, args.yolo, cmd_tx, msg_rx));
+        let status = headless(&prompt, args.yolo, cmd_tx, msg_rx);
+        trace::stop();
+        std::process::exit(status);
     }
     let opts = ui::Options {
         cwd: args.cfg.cwd,
@@ -168,7 +182,10 @@ fn main() {
         accept_all: args.yolo,
         mouse: args.mouse,
     };
-    if let Err(e) = ui::run(opts, cmd_tx, msg_tx, msg_rx, stop) {
+    let result = ui::run(opts, cmd_tx, msg_tx, msg_rx, stop);
+    // the tokens not written yet
+    trace::stop();
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
