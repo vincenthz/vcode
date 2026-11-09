@@ -44,9 +44,10 @@ usage: vcode [options] [directory]
                            formalize, document), keeping the overall view
       --no-think           answer without reasoning first (faster)
       --effort <level>     reasoning effort: low, medium, xhigh [default: medium]
-  -c, --ctx <n>            context size in tokens [default: 65536]
+  -c, --ctx <n>            context size in tokens, e.g. 262144 or 256k; /context
+                           changes it while running [default: 256k]
       --sub-ctx <n>        context size of the subagents the agent gives tasks
-                           to, 0 for no subagents [default: 32768]
+                           to, 0 for no subagents [default: 128k]
       --parallel <n>       subagents working at the same time at most, their
                            passes batched on the engine; 1 for one at a time
                            [default: 4]
@@ -74,8 +75,8 @@ fn parse_args() -> Result<Args, String> {
         cfg: Config {
             model: String::new(),
             cpu: !cfg!(target_os = "macos"),
-            context: 65536,
-            sub_context: 32768,
+            context: 256 << 10,
+            sub_context: 128 << 10,
             pilot: false,
             max_tokens: 16384,
             thinking: true,
@@ -97,6 +98,9 @@ fn parse_args() -> Result<Args, String> {
             v.parse()
                 .map_err(|_| format!("{flag}: invalid value '{v}'"))
         }
+        fn tokens(flag: &str, v: String) -> Result<usize, String> {
+            agent::parse_tokens(&v).ok_or_else(|| format!("{flag}: invalid size '{v}'"))
+        }
         match flag.as_str() {
             "-m" | "--model" => a.cfg.model = val()?,
             "-p" | "--prompt" => a.prompt = Some(val()?),
@@ -108,8 +112,8 @@ fn parse_args() -> Result<Args, String> {
                 a.cfg.effort = ReasoningEffort::parse(&v)
                     .ok_or_else(|| format!("--effort: unknown level '{v}'"))?
             }
-            "-c" | "--ctx" => a.cfg.context = num(&flag, val()?)?,
-            "--sub-ctx" => a.cfg.sub_context = num(&flag, val()?)?,
+            "-c" | "--ctx" => a.cfg.context = tokens(&flag, val()?)?,
+            "--sub-ctx" => a.cfg.sub_context = tokens(&flag, val()?)?,
             "--parallel" => {
                 a.cfg.parallel = num(&flag, val()?)?;
                 if a.cfg.parallel == 0 {
@@ -216,7 +220,8 @@ fn headless(
                 model,
                 backend,
                 context,
-            } => eprintln!("[{model} · {backend} · {context} tokens]"),
+                sub_context,
+            } => eprintln!("[{model} · {backend} · {context} tokens, {sub_context} for subagents]"),
             Msg::Info(s) => {
                 nl(&mut out, &mut mid_line);
                 eprintln!("{indent}[{s}]");

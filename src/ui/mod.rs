@@ -43,7 +43,10 @@ const COMMANDS: [(&str, &str); 10] = [
         "/pilot",
         "pilot mode on or off: the agent plans and directs subagents",
     ),
-    ("/context", "show the context use"),
+    (
+        "/context",
+        "show the context use, or resize it: /context 128k, /context sub 64k",
+    ),
     ("/quit", "exit"),
     ("/exit", "exit"),
 ];
@@ -182,6 +185,8 @@ struct App {
     model: String,
     backend: String,
     context: usize,
+    /// of a subagent, 0 for no subagents
+    sub_context: usize,
     used: usize,
     mode: Mode,
     thinking: bool,
@@ -267,6 +272,7 @@ impl App {
             model: String::new(),
             backend: String::new(),
             context: 0,
+            sub_context: 0,
             used: 0,
             mode: if opts.accept_all {
                 Mode::AcceptAll
@@ -402,10 +408,20 @@ impl App {
                 model,
                 backend,
                 context,
+                sub_context,
             } => {
                 self.model = model;
                 self.backend = backend;
                 self.context = context;
+                self.sub_context = sub_context;
+                self.touch(0);
+            }
+            Msg::Resized {
+                context,
+                sub_context,
+            } => {
+                self.context = context;
+                self.sub_context = sub_context;
                 self.touch(0);
             }
             Msg::Generating => self.phase = Phase::Prompt,
@@ -913,15 +929,48 @@ impl App {
                 self.notify(format!("mode: {}", self.mode.label()));
             }
             "/context" => {
-                let s = format!(
-                    "context: {} of {} tokens ({:.0}%) · {} · {}",
-                    self.used,
-                    self.context,
-                    100.0 * self.used as f64 / self.context.max(1) as f64,
-                    self.model,
-                    self.backend
-                );
-                self.push(Entry::Info(s));
+                let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+                let (sub, size) = match args[..] {
+                    [] => (false, None),
+                    ["sub"] => (true, None),
+                    [n] => (false, Some(n)),
+                    ["sub", n] => (true, Some(n)),
+                    _ => {
+                        self.notify("/context [sub] [size], e.g. /context 128k");
+                        return;
+                    }
+                };
+                match size {
+                    None if !sub => {
+                        let mut s = format!(
+                            "context: {} of {} tokens ({:.0}%) · {} · {}",
+                            self.used,
+                            self.context,
+                            100.0 * self.used as f64 / self.context.max(1) as f64,
+                            self.model,
+                            self.backend
+                        );
+                        if self.sub_context > 0 {
+                            s.push_str(&format!(" · subagents: {} tokens", self.sub_context));
+                        }
+                        self.push(Entry::Info(s));
+                    }
+                    None => {
+                        self.push(Entry::Info(format!(
+                            "subagents' context: {} tokens",
+                            self.sub_context
+                        )));
+                    }
+                    Some(_) if !idle => self.notify("wait for the answer, or esc to interrupt it"),
+                    Some(n) => match crate::agent::parse_tokens(n) {
+                        Some(tokens) if tokens > 0 => {
+                            self.phase = Phase::Prompt;
+                            self.busy_since = Some(Instant::now());
+                            let _ = self.cmd.send(Cmd::Resize { sub, tokens });
+                        }
+                        _ => self.notify(format!("invalid size '{n}', e.g. 131072 or 128k")),
+                    },
+                }
             }
             _ => self.notify(format!("unknown command {name}, /help lists them")),
         }
@@ -1733,6 +1782,7 @@ mod tests {
             model: "Qwen3.6-35B-A3B".into(),
             backend: "metal".into(),
             context: 65536,
+            sub_context: 32768,
         });
         app.message(Msg::Idle);
         typed(&mut app, "fix the tests");
@@ -1854,6 +1904,54 @@ mod tests {
         app.verbose = true;
         app.touch_all();
         assert!(screen(&mut app, 60, 16).contains("Grep"));
+    }
+
+    #[test]
+    fn context_sizes() {
+        let (cmd, cmds) = channel();
+        let (own, _) = channel();
+        let opts = Options {
+            cwd: "/work/proj".into(),
+            thinking: false,
+            accept_all: false,
+            mouse: false,
+        };
+        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+        app.message(Msg::Idle);
+        let mut run = |app: &mut App, line: &str| {
+            typed(app, line);
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        run(&mut app, "/context 64k");
+        assert!(matches!(
+            cmds.try_recv(),
+            Ok(Cmd::Resize {
+                sub: false,
+                tokens: 65536
+            })
+        ));
+        // busy until the agent is done
+        run(&mut app, "/context sub 32768");
+        assert!(cmds.try_recv().is_err());
+        app.message(Msg::Resized {
+            context: 65536,
+            sub_context: 131072,
+        });
+        app.message(Msg::Idle);
+        assert_eq!(app.context, 65536);
+        run(&mut app, "/context sub 32768");
+        assert!(matches!(
+            cmds.try_recv(),
+            Ok(Cmd::Resize {
+                sub: true,
+                tokens: 32768
+            })
+        ));
+        app.message(Msg::Idle);
+        for bad in ["/context 0", "/context lots", "/context sub 1 2"] {
+            run(&mut app, bad);
+            assert!(cmds.try_recv().is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -76,6 +76,12 @@ pub enum Cmd {
     Thinking(bool),
     /// pilot mode on or off, in a new conversation
     Pilot(bool),
+    /// tokens of context of the conversation, or of the subagents' if `sub`:
+    /// the conversation goes on, processed again
+    Resize {
+        sub: bool,
+        tokens: usize,
+    },
 }
 
 /// The user's answer to a tool call that needs approval
@@ -93,6 +99,13 @@ pub enum Msg {
         model: String,
         backend: String,
         context: usize,
+        /// of a subagent, 0 for no subagents
+        sub_context: usize,
+    },
+    /// the contexts' sizes changed
+    Resized {
+        context: usize,
+        sub_context: usize,
     },
     /// a turn of the model starts: its prompt is being processed
     Generating,
@@ -334,11 +347,13 @@ fn session<'m>(
     });
     let opts = main_options(&base, &cfg.cwd, cfg.pilot, subagents, parallel);
     let context = opts.context;
+    let sub_context = sub_base.as_ref().map_or(0, |o| o.context);
     let mut chat = Chat::new(engine, tok, opts).map_err(|e| e.to_string())?;
     let _ = tx.send(Msg::Ready {
         model: setup.name,
         backend: engine.description(),
         context,
+        sub_context,
     });
 
     // the system prompt and the tools, processed once for every conversation
@@ -369,6 +384,7 @@ fn session<'m>(
         pilot: cfg.pilot,
         base,
         subagents,
+        max_context: setup.max_context,
         carry: Vec::new(),
         worker: Worker {
             engine,
@@ -430,6 +446,10 @@ fn session<'m>(
                 let _ = tx.send(Msg::Pilot(agent.pilot));
                 let _ = tx.send(Msg::Idle);
             }
+            Cmd::Resize { sub, tokens } => {
+                agent.resize(sub, tokens);
+                let _ = tx.send(Msg::Idle);
+            }
         }
     }
     Ok(())
@@ -445,6 +465,8 @@ struct Agent<'m> {
     /// the options all chats share
     base: ChatOptions,
     subagents: bool,
+    /// tokens of the model's context, at most
+    max_context: usize,
     /// text to put before the next message: a summary, command outputs
     carry: Vec<String>,
     worker: Worker<'m>,
@@ -1056,6 +1078,100 @@ impl Agent<'_> {
             .expect("the prefix of the current mode is made when switching to it")
     }
 
+    /// A new size of the context of the conversation, or of the subagents'
+    /// if `sub`, capped by the model's
+    fn resize(&mut self, sub: bool, tokens: usize) {
+        let n = tokens.min(self.max_context);
+        if n < tokens {
+            self.worker
+                .info(format!("the model's context is {n} tokens at most"));
+        }
+        if sub {
+            self.resize_sub(n);
+        } else {
+            self.resize_main(n);
+        }
+        self.worker.send(Msg::Resized {
+            context: self.chat.opts.context,
+            sub_context: self.worker.sub_base.as_ref().map_or(0, |o| o.context),
+        });
+    }
+
+    /// The conversation in a new session of `n` tokens, processed again, or
+    /// unchanged when it doesn't fit
+    fn resize_main(&mut self, n: usize) {
+        let old = self.chat.opts.context;
+        if n == old {
+            self.worker.info(format!("context: already {n} tokens"));
+            return;
+        }
+        let tokens = self.chat.n_tokens();
+        if tokens as f64 > COMPACT_AT * n as f64 {
+            self.worker.send(Msg::Error(format!(
+                "the conversation ({tokens} tokens) doesn't fit in {n}; /compact or /clear first"
+            )));
+            return;
+        }
+        let prefix = self.prefixes[self.pilot as usize]
+            .as_ref()
+            .expect("the prefix of the current mode is made when switching to it");
+        // only the system prompt: restored, rather than processed again
+        let fresh = tokens <= prefix.n_past();
+        let transcript = self.chat.transcript();
+        if !fresh {
+            self.worker.info(format!(
+                "processing the conversation again ({tokens} tokens)"
+            ));
+        }
+        let renew = |chat: &mut Chat, context: usize| {
+            chat.opts.context = context;
+            chat.reset()?;
+            if fresh {
+                chat.restore(prefix)
+            } else {
+                chat.restore_transcript(&transcript)
+            }
+        };
+        match renew(&mut self.chat, n) {
+            Ok(()) => {
+                self.base.context = n;
+                self.worker.info(format!("context: {n} tokens"));
+            }
+            Err(e) => {
+                self.worker
+                    .send(Msg::Error(format!("context of {n} tokens: {e}")));
+                if let Err(e) = renew(&mut self.chat, old) {
+                    self.worker.send(Msg::Error(format!(
+                        "restoring the conversation: {e}; /clear to go on"
+                    )));
+                }
+            }
+        }
+        self.worker.send(Msg::Context(self.chat.n_past()));
+    }
+
+    /// The subagents' context, for the tasks that start from now on
+    fn resize_sub(&mut self, n: usize) {
+        // the system prompts of the roles used so far, kept
+        let system = self.worker.roles.values().map(Prefix::n_past).max();
+        let Some(opts) = &mut self.worker.sub_base else {
+            self.worker.send(Msg::Error(
+                "no subagents: start vcode with --sub-ctx above 0".into(),
+            ));
+            return;
+        };
+        if let Some(system) = system
+            && system as f64 > COMPACT_AT * n as f64
+        {
+            self.worker.send(Msg::Error(format!(
+                "{n} tokens is too small for a subagent's system prompt ({system} tokens)"
+            )));
+            return;
+        }
+        opts.context = n;
+        self.worker.info(format!("subagents' context: {n} tokens"));
+    }
+
     /// The part of the context in use
     fn used(&self) -> f64 {
         self.chat.n_past() as f64 / self.chat.opts.context as f64
@@ -1207,6 +1323,20 @@ impl Agent<'_> {
     }
 }
 
+/// A number of tokens: `131072`, or with a suffix, `128k` or `1m` (powers of
+/// 1024)
+pub fn parse_tokens(s: &str) -> Option<usize> {
+    let s = s.trim().to_ascii_lowercase();
+    let (digits, unit) = match s.strip_suffix('k') {
+        Some(d) => (d, 1 << 10),
+        None => match s.strip_suffix('m') {
+            Some(d) => (d, 1 << 20),
+            None => (s.as_str(), 1),
+        },
+    };
+    digits.parse::<usize>().ok()?.checked_mul(unit)
+}
+
 /// A call that could not be planned, as shown
 fn describe(call: &ToolCall) -> String {
     let args: Vec<String> = call
@@ -1215,4 +1345,20 @@ fn describe(call: &ToolCall) -> String {
         .map(|(k, v)| format!("{k}={}", tools::clip(v.lines().next().unwrap_or(""), 40)))
         .collect();
     format!("{}({})", call.name, args.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_sizes() {
+        assert_eq!(parse_tokens("131072"), Some(131072));
+        assert_eq!(parse_tokens("128k"), Some(131072));
+        assert_eq!(parse_tokens("256K"), Some(262144));
+        assert_eq!(parse_tokens("1m"), Some(1 << 20));
+        for bad in ["", "k", "12kb", "-1", "1.5k", "99999999999999999999m"] {
+            assert_eq!(parse_tokens(bad), None, "{bad}");
+        }
+    }
 }

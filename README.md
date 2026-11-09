@@ -56,7 +56,7 @@ It is processed once at startup and saved, so `/clear` is instant.
 
 `task(agent, description, prompt)` hands work to a subagent, which starts
 knowing nothing of the conversation, works in a context of its own
-(`--sub-ctx`, 32k by default; `0` turns subagents off), runs its own tool loop,
+(`--sub-ctx`, 128k by default; `0` turns subagents off), runs its own tool loop,
 and whose final report is the result of the call. The main conversation only
 grows by that report, however many files the subagent read. Its edits and
 commands are approved like the agent's, and its calls show under the task,
@@ -77,7 +77,7 @@ Each kind of subagent has its own instructions and tools:
 The system prompt of each kind is processed the first time it is used and
 saved, and every task gets a chat of its own that starts from its kind's (a
 saved system prompt is a copy of the recurrent states plus its tokens' KV
-cache; a task's session is 1.5 GB with the 35B-A3B at 32k).
+cache; a task's session is about 3.5 GB with the 35B-A3B at 128k).
 
 ### Tasks at the same time
 
@@ -93,7 +93,7 @@ and approvals they ask for at the same time are asked one after the other.
 
 Two explore tasks on the 35B-A3B (M2 Max) answer at about 50 tok/s each, about
 100 tok/s together against 115 for one alone. Each task running needs its own
-session: 4 at 32k are about 6 GB on top of the model. MTP drafts gain less in a
+session: 4 at 128k are about 14 GB on top of the model. MTP drafts gain less in a
 batch (see biv's numbers): with many tasks at once, `-d 1` can be faster.
 `--parallel 1` runs tasks one after the other on the engine itself, without the
 scheduler.
@@ -132,6 +132,13 @@ conversation is compacted.
 Commands: `/clear`, `/compact` (replace the conversation with the model's
 summary of it, which also happens by itself at 80% of the context), `/pilot`,
 `/think`, `/nothink`, `/mode`, `/context`, `/help`, `/quit`.
+
+The context is 256k tokens by default (`-c`), at most the model's; a session
+allocates its whole KV cache up front, about 6.5 GB with the 35B-A3B at 256k.
+`/context` shows its use, and `/context 64k` changes its size while running:
+the conversation goes on in a new session, its tokens processed again (it must
+fit in 80% of the new size). `/context sub 64k` changes the subagents' for the
+tasks that start from then on. Sizes are tokens, or with `k` or `m`.
 
 ## Layout
 
