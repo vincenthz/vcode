@@ -3,6 +3,7 @@
 
 mod input;
 mod text;
+pub mod themes;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::stdout;
@@ -24,12 +25,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
+use themes::Theme;
+
 use crate::agent::{Cmd, Decision, Msg};
 use crate::tools::{DiffLine, Kind, Tool, clip};
 use input::Input;
 use text::{markdown, width, wrap, wrap_plain};
 
-const COMMANDS: [(&str, &str); 11] = [
+const COMMANDS: [(&str, &str); 12] = [
     ("/help", "keys and commands"),
     ("/clear", "start a new conversation"),
     (
@@ -48,6 +51,10 @@ const COMMANDS: [(&str, &str); 11] = [
         "show the context use, or resize it: /context 128k, /context sub 64k",
     ),
     (
+        "/theme",
+        "change the color theme: /theme nord, /theme dracula, /theme catppuccin, /theme monokai, /theme onedark, /theme gruvbox, /theme default (also shift+ctrl+t)",
+    ),
+    (
         "/debug",
         "trace prompts, tokens and tool calls to a file: /debug <file>, /debug off",
     ),
@@ -58,14 +65,21 @@ const COMMANDS: [(&str, &str); 11] = [
 const HELP_KEYS: &str = "\
 enter send · shift+enter, alt+enter, ctrl+j or \\ then enter: new line
 esc interrupt · ctrl+c interrupt, clear, or quit · ctrl+d quit
-shift+tab permission mode · ctrl+t show reasoning · ctrl+o expand tool output
-pgup/pgdn or the mouse wheel scroll · up/down history
+shift+tab permission mode · ctrl+t show reasoning · shift+ctrl+t cycle theme
+ctrl+o expand tool output · pgup/pgdn or the mouse wheel scroll
 !<command> runs a shell command; its output goes with your next message";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const OUTPUT_LINES: usize = 5;
 const DIFF_LINES: usize = 40;
 const MAX_TOOL_OUTPUT: usize = 256 * 1024;
+
+/// A shortcut for building a themed style.
+macro_rules! themed {
+    ($self:expr, $purpose:ident) => {
+        $self.theme.style(themes::ColorPurpose::$purpose)
+    };
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -167,6 +181,7 @@ pub struct Options {
     pub thinking: bool,
     pub accept_all: bool,
     pub mouse: bool,
+    pub theme: Theme,
 }
 
 struct App {
@@ -215,6 +230,8 @@ struct App {
     quit_armed: Option<Instant>,
     notice: Option<(String, Instant)>,
     quit: bool,
+
+    theme: Theme,
 }
 
 pub fn run(
@@ -298,6 +315,7 @@ impl App {
             quit_armed: None,
             notice: None,
             quit: false,
+            theme: opts.theme,
         }
     }
 
@@ -807,6 +825,11 @@ impl App {
                 self.show_thinking = !self.show_thinking;
                 self.touch_all();
             }
+            KeyCode::Char('t') if ctrl && shift => {
+                self.theme = self.theme.next();
+                self.touch_all();
+                self.notify(format!("theme: {}", self.theme.name()));
+            }
             KeyCode::Char('o') if ctrl => {
                 self.verbose = !self.verbose;
                 self.touch_all();
@@ -940,6 +963,32 @@ impl App {
             "/mode" => {
                 self.mode = self.mode.next();
                 self.notify(format!("mode: {}", self.mode.label()));
+            }
+            "/theme" => {
+                let arg = line[name.len()..].trim();
+                match arg {
+                    "" => {
+                        self.theme = self.theme.next();
+                        self.notify(format!("theme: {}", self.theme.name()));
+                    }
+                    n => match Theme::from_str(n) {
+                        Some(t) => {
+                            self.theme = t;
+                            self.notify(format!("theme: {}", self.theme.name()));
+                        }
+                        None => {
+                            let themes = [
+                                "default", "nord", "dracula", "catppuccin", "monokai",
+                                "one-dark", "gruvbox",
+                            ];
+                            self.notify(format!(
+                                "unknown theme '{n}'; available: {}",
+                                themes.join(", ")
+                            ));
+                        }
+                    },
+                }
+                self.touch_all();
             }
             "/context" => {
                 let args: Vec<&str> = line.split_whitespace().skip(1).collect();
@@ -1086,7 +1135,7 @@ impl App {
             .iter()
             .map(|(c, d)| {
                 Line::from(vec![
-                    Span::styled(format!("  {c:<10} "), Style::new().fg(Color::Cyan)),
+                    Span::styled(format!("  {c:<10} "), themed!(self, Cyan)),
                     Span::styled(*d, DIM),
                 ])
             })
@@ -1112,7 +1161,7 @@ impl App {
                     let p = if i == 0 {
                         Span::styled(
                             "› ",
-                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            themed!(self, CyanBold),
                         )
                     } else {
                         Span::raw("  ")
@@ -1126,7 +1175,7 @@ impl App {
                     Paragraph::new(Line::from(vec![
                         Span::styled(
                             "› ",
-                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            themed!(self, CyanBold),
                         ),
                         Span::styled("ask for a change, a fix, an explanation… (/help)", DIM),
                     ])),
@@ -1146,7 +1195,7 @@ impl App {
 
     fn spinner_line(&self) -> Line<'static> {
         if let Some((n, _)) = &self.notice {
-            return Line::styled(format!("  {n}"), Style::new().fg(Color::Yellow));
+            return Line::styled(format!("  {n}"), themed!(self, Yellow));
         }
         let what = match &self.phase {
             Phase::Idle | Phase::Dead => return Line::raw(""),
@@ -1165,8 +1214,8 @@ impl App {
             .map_or(0, |d| d.as_millis());
         let frame = FRAMES[(ms / 100) as usize % FRAMES.len()];
         let mut spans = vec![
-            Span::styled(format!("  {frame} "), Style::new().fg(Color::Magenta)),
-            Span::styled(format!("{what}…"), Style::new().fg(Color::Magenta)),
+            Span::styled(format!("  {frame} "), themed!(self, Magenta)),
+            Span::styled(format!("{what}…"), themed!(self, Magenta)),
         ];
         if self.busy_since.is_some() {
             spans.push(Span::styled(
@@ -1180,14 +1229,14 @@ impl App {
     fn status_line(&self, w: usize) -> Line<'static> {
         let mode_style = match self.mode {
             Mode::Ask => DIM,
-            Mode::AcceptEdits => Style::new().fg(Color::Yellow),
-            Mode::AcceptAll => Style::new().fg(Color::Red),
+            Mode::AcceptEdits => themed!(self, Yellow),
+            Mode::AcceptAll => themed!(self, Red),
         };
         let pct = 100.0 * self.used as f64 / self.context.max(1) as f64;
         let ctx_style = if pct > 80.0 {
-            Style::new().fg(Color::Red)
+            themed!(self, Red)
         } else if pct > 60.0 {
-            Style::new().fg(Color::Yellow)
+            themed!(self, Yellow)
         } else {
             DIM
         };
@@ -1217,7 +1266,7 @@ impl App {
                 (true, Some((done, all))) => format!("pilot · plan {done}/{all} · "),
                 (true, None) => "pilot · ".into(),
             },
-            Style::new().fg(Color::Magenta),
+            themed!(self, AccentMild),
         );
         let mode = Span::styled(format!("  ⏵ {}", self.mode.label()), mode_style);
         let hint = Span::styled(" (shift+tab)", DIM);
@@ -1258,17 +1307,17 @@ impl App {
         };
         let block = Block::bordered()
             .padding(ratatui::widgets::Padding::horizontal(1))
-            .border_style(Style::new().fg(Color::Yellow))
+            .border_style(themed!(self, Yellow))
             .title(Span::styled(
                 format!(" {question} "),
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                themed!(self, Yellow).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let key = |k: &str| {
             Span::styled(
                 k.to_string(),
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                themed!(self, Yellow).add_modifier(Modifier::BOLD),
             )
         };
         let lines = vec![
@@ -1344,7 +1393,7 @@ impl App {
                 f.render_widget(
                     Paragraph::new(Span::styled(
                         tag,
-                        Style::new().fg(Color::Black).bg(Color::Yellow),
+                        themed!(self, BlackOnBg),
                     )),
                     r,
                 );
@@ -1386,7 +1435,7 @@ impl App {
         let indent = [Span::raw("  ")];
         match entry {
             Entry::Banner => {
-                let accent = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+                let accent = themed!(self, Accent);
                 out.push(Line::from(vec![
                     Span::styled(" ✻ vcode", accent),
                     Span::styled("  a coding agent on your machine, running on biv", DIM),
@@ -1411,7 +1460,7 @@ impl App {
                 if self.pilot {
                     out.push(Line::styled(
                         "   pilot mode: the agent plans and directs subagents (/pilot to leave)",
-                        Style::new().fg(Color::Magenta),
+                        themed!(self, AccentMild),
                     ));
                 }
                 out.push(Line::styled("   /help for commands · esc interrupts · shift+tab changes what needs approval", DIM));
@@ -1424,7 +1473,7 @@ impl App {
                     w,
                     &[Span::styled(
                         "› ",
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        themed!(self, CyanBold),
                     )],
                     &indent,
                 ));
@@ -1457,13 +1506,13 @@ impl App {
                     t.trim_end(),
                     Style::new(),
                     w,
-                    &[Span::styled("● ", Style::new().fg(Color::White))],
+                    &[Span::styled("● ", themed!(self, White))],
                     &indent,
                 ));
             }
             Entry::Tool(t) => self.render_tool(t, w, &mut out),
             Entry::Shell { cmd, output } => {
-                let style = Style::new().fg(Color::Magenta);
+                let style = themed!(self, Magenta);
                 out.extend(wrap_plain(
                     cmd,
                     Style::new().add_modifier(Modifier::BOLD),
@@ -1480,7 +1529,7 @@ impl App {
                         let st = if *ok {
                             DIM
                         } else {
-                            Style::new().fg(Color::Red)
+                            themed!(self, Red)
                         };
                         for (j, l) in lines.iter().skip(n - shown).enumerate() {
                             let p = if j == 0 { "  ⎿  " } else { "     " };
@@ -1511,7 +1560,7 @@ impl App {
                 ));
             }
             Entry::Error(t) => {
-                let red = Style::new().fg(Color::Red);
+                let red = themed!(self, Red);
                 out.extend(wrap_plain(
                     t,
                     red,
@@ -1523,7 +1572,7 @@ impl App {
             Entry::Stats(t) => {
                 out.push(Line::styled(
                     format!("  {t}"),
-                    Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    DIM.add_modifier(Modifier::DIM),
                 ));
             }
             Entry::Plan { overview, tasks } => self.render_plan(overview, tasks, w, &mut out),
@@ -1533,9 +1582,9 @@ impl App {
 
     fn render_tool(&self, t: &ToolRun, w: usize, out: &mut Vec<Line<'static>>) {
         let (dot, dot_style) = match &t.state {
-            ToolState::Done { ok: true, .. } => ("⏺ ", Style::new().fg(Color::Green)),
-            ToolState::Done { ok: false, .. } => ("⏺ ", Style::new().fg(Color::Red)),
-            ToolState::Asking => ("⏺ ", Style::new().fg(Color::Yellow)),
+            ToolState::Done { ok: true, .. } => ("⏺ ", themed!(self, Green)),
+            ToolState::Done { ok: false, .. } => ("⏺ ", themed!(self, Red)),
+            ToolState::Asking => ("⏺ ", themed!(self, Yellow)),
             _ => ("⏺ ", Style::new().fg(Color::Gray)),
         };
         let bold = Style::new().add_modifier(Modifier::BOLD);
@@ -1587,21 +1636,21 @@ impl App {
                 let style = if *ok {
                     DIM
                 } else {
-                    Style::new().fg(Color::Red)
+                    themed!(self, Red)
                 };
                 out.extend(branch(format!("{summary} (ctrl+o shows its calls)"), style));
             }
             ToolState::Waiting => {}
             ToolState::Asking => out.extend(branch(
                 "waiting for approval".into(),
-                Style::new().fg(Color::Yellow),
+                themed!(self, Yellow),
             )),
             ToolState::Running => {}
             ToolState::Done { ok, summary } => {
                 let style = if *ok {
                     DIM
                 } else {
-                    Style::new().fg(Color::Red)
+                    themed!(self, Red)
                 };
                 out.extend(branch(summary.clone(), style));
             }
@@ -1611,7 +1660,7 @@ impl App {
         if let Some(diff) = &t.diff
             && !denied
         {
-            render_diff(diff, w, self.verbose, out);
+            render_diff(diff, w, self.verbose, self.theme, out);
         }
         if !t.output.is_empty() {
             let text = crate::tools::strip_ansi(&t.output);
@@ -1685,7 +1734,7 @@ impl App {
         let marks: Vec<_> = tasks.lines().filter_map(|l| task_line(l).0).collect();
         let done = marks.iter().filter(|m| **m == Mark::Done).count();
         out.push(Line::from(vec![
-            Span::styled("⏺ ", Style::new().fg(Color::Magenta)),
+            Span::styled("⏺ ", themed!(self, Magenta)),
             Span::styled("Plan", bold),
             Span::styled(format!("  {done}/{} done", marks.len()), DIM),
         ]));
@@ -1711,12 +1760,12 @@ impl App {
         for line in tasks.lines().filter(|l| !l.trim().is_empty()) {
             let (mark, text) = task_line(line);
             let (sym, style) = match mark {
-                Some(Mark::Done) => ("✓ ", Style::new().fg(Color::Green)),
+                Some(Mark::Done) => ("✓ ", themed!(self, Green)),
                 Some(Mark::Doing) => (
                     "◐ ",
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    themed!(self, Yellow).add_modifier(Modifier::BOLD),
                 ),
-                Some(Mark::Blocked) => ("✗ ", Style::new().fg(Color::Red)),
+                Some(Mark::Blocked) => ("✗ ", themed!(self, Red)),
                 Some(Mark::Todo) => ("○ ", Style::new()),
                 None => ("  ", DIM),
             };
@@ -1734,7 +1783,13 @@ impl App {
     }
 }
 
-fn render_diff(diff: &[DiffLine], w: usize, verbose: bool, out: &mut Vec<Line<'static>>) {
+fn render_diff(
+    diff: &[DiffLine],
+    w: usize,
+    verbose: bool,
+    theme: Theme,
+    out: &mut Vec<Line<'static>>,
+) {
     let num_w = diff
         .iter()
         .map(|l| match l {
@@ -1746,11 +1801,13 @@ fn render_diff(diff: &[DiffLine], w: usize, verbose: bool, out: &mut Vec<Line<'s
         .max()
         .unwrap_or(1);
     let limit = if verbose { usize::MAX } else { DIFF_LINES };
+    let red = theme.style(themes::ColorPurpose::Red);
+    let green = theme.style(themes::ColorPurpose::Green);
     for l in diff.iter().take(limit) {
         let (n, sign, text, style) = match l {
             DiffLine::Same(n, t) => (n.to_string(), ' ', t, DIM),
-            DiffLine::Removed(n, t) => (n.to_string(), '-', t, Style::new().fg(Color::Red)),
-            DiffLine::Added(n, t) => (n.to_string(), '+', t, Style::new().fg(Color::Green)),
+            DiffLine::Removed(n, t) => (n.to_string(), '-', t, red),
+            DiffLine::Added(n, t) => (n.to_string(), '+', t, green),
             DiffLine::Gap => {
                 out.push(Line::styled(format!("     {:>num_w$}  ⋮", ""), DIM));
                 continue;
@@ -1817,6 +1874,7 @@ mod tests {
             thinking: true,
             accept_all: false,
             mouse: false,
+            theme: Theme::default(),
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Ready {
@@ -1899,6 +1957,7 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
+            theme: Theme::default(),
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
@@ -1956,8 +2015,8 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
-        };
-        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+            theme: Theme::default(),
+        };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
         let mut run = |app: &mut App, line: &str| {
             typed(app, line);
@@ -2004,8 +2063,8 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
-        };
-        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+            theme: Theme::default(),
+        };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
         let sub = |task: usize, m: Msg| Msg::Sub {
             task,
@@ -2102,8 +2161,8 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
-        };
-        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+            theme: Theme::default(),
+        };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Pilot(true));
         app.message(Msg::Idle);
         app.message(Msg::Plan {

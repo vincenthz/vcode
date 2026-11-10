@@ -181,6 +181,7 @@ fn main() {
         thinking: args.cfg.thinking,
         accept_all: args.yolo,
         mouse: args.mouse,
+        theme: ui::themes::Theme::default(),
     };
     let result = ui::run(opts, cmd_tx, msg_tx, msg_rx, stop);
     // the tokens not written yet
