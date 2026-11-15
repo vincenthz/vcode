@@ -125,7 +125,13 @@ conversation is compacted.
 - enter sends; shift+enter, alt+enter, ctrl+j, or `\` then enter, start a new line
 - esc interrupts the model or a running command; messages typed while it works are queued
 - ctrl+t shows the reasoning, ctrl+o expands tool output and diffs
-- pgup/pgdn or the mouse wheel scroll (`--no-mouse` leaves the mouse to the terminal, for selecting text)
+- pgup/pgdn or the mouse wheel scroll
+- drag over the transcript to select, and the selection is copied when the
+  button is released; double-click selects a word (or a path with its line
+  number), triple-click a line; dragging past the top or bottom scrolls. The
+  copy goes through `pbcopy` (`wl-copy`, `xclip`, `xsel` on Linux), or over
+  ssh through the terminal (OSC 52; in tmux, `set -g set-clipboard on`).
+  `--no-mouse` leaves the mouse to the terminal instead
 - up/down go through the history
 - `!cmd` runs a shell command; its output goes to the model with your next message
 - ctrl+p (or `/ps`) lists the shell commands running, the agents' and yours:

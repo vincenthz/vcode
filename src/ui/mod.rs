@@ -1,6 +1,7 @@
 //! The terminal interface: the transcript, the input, the approval of tool
 //! calls, the status line.
 
+mod clipboard;
 mod input;
 mod text;
 pub mod themes;
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -72,6 +73,7 @@ enter send · shift+enter, alt+enter, ctrl+j or \\ then enter: new line
 esc interrupt · ctrl+c interrupt, clear, or quit · ctrl+d quit
 shift+tab permission mode · ctrl+t show reasoning · shift+ctrl+t cycle theme
 ctrl+o expand tool output · pgup/pgdn or the mouse wheel scroll
+drag to select and copy · double-click a word, triple-click a line
 ctrl+p the shell commands running: ↑↓ select, k kill, esc close
 !<command> runs a shell command; its output goes with your next message";
 
@@ -238,6 +240,17 @@ struct App {
     tools: HashMap<usize, usize>,
     queue: VecDeque<String>,
 
+    /// where the transcript was last drawn, and its first line shown
+    view: (Rect, usize),
+    /// the text selected in the transcript
+    sel: Option<Selection>,
+    /// the last click, for double and triple clicks: when, where, how many
+    click: Option<(Instant, u16, u16, u8)>,
+    /// what was last copied
+    copied: String,
+    /// copies to the clipboard: how it did
+    clipboard: fn(&str) -> Result<&'static str, String>,
+
     /// lines from the bottom of the transcript, 0 to follow it
     scroll: usize,
     last_total: usize,
@@ -326,6 +339,11 @@ impl App {
             asks: VecDeque::new(),
             tools: HashMap::new(),
             queue: VecDeque::new(),
+            view: (Rect::default(), 0),
+            sel: None,
+            click: None,
+            copied: String::new(),
+            clipboard: clipboard::copy,
             scroll: 0,
             last_total: 0,
             page: 20,
@@ -373,18 +391,12 @@ impl App {
                             }
                             dirty = true;
                         }
-                        TermEvent::Mouse(m) => match m.kind {
-                            MouseEventKind::ScrollUp => {
-                                self.scroll += 3;
-                                dirty = true;
-                            }
-                            MouseEventKind::ScrollDown => {
-                                self.scroll = self.scroll.saturating_sub(3);
-                                dirty = true;
-                            }
-                            _ => {}
-                        },
-                        TermEvent::Resize(..) => dirty = true,
+                        TermEvent::Mouse(m) => dirty |= self.mouse(m),
+                        TermEvent::Resize(..) => {
+                            // the transcript wraps anew: its lines change
+                            self.sel = None;
+                            dirty = true;
+                        }
                         _ => {}
                     }
                     if !event::poll(Duration::ZERO)? {
@@ -824,6 +836,7 @@ impl App {
             KeyCode::Esc => {
                 if self.busy() && self.phase != Phase::Loading {
                     self.interrupt();
+                } else if self.sel.take().is_some() {
                 } else if self.scroll > 0 {
                     self.scroll = 0;
                 }
@@ -956,6 +969,7 @@ impl App {
             "/clear" | "/reset" | "/new" if idle => {
                 self.entries.truncate(1);
                 self.cache.truncate(1);
+                self.sel = None;
                 self.tools.clear();
                 self.scroll = 0;
                 let _ = self.cmd.send(Cmd::Clear);
@@ -965,6 +979,7 @@ impl App {
             "/pilot" if idle => {
                 self.entries.truncate(1);
                 self.cache.truncate(1);
+                self.sel = None;
                 self.tools.clear();
                 self.scroll = 0;
                 self.progress = None;
@@ -1505,6 +1520,177 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// A mouse event: whether to draw again
+    fn mouse(&mut self, m: MouseEvent) -> bool {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll += 3,
+            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let count = match self.click {
+                    Some((t, x, y, n))
+                        if x == m.column
+                            && y == m.row
+                            && t.elapsed() < Duration::from_millis(400) =>
+                    {
+                        n % 3 + 1
+                    }
+                    _ => 1,
+                };
+                self.click = Some((Instant::now(), m.column, m.row, count));
+                self.sel = None;
+                let Some(at) = self.point(m.column, m.row, false) else {
+                    return true;
+                };
+                let (anchor, head) = match count {
+                    2 => self.word(at),
+                    3 => ((at.0, 0), (at.0, self.line_width(at.0).saturating_sub(1))),
+                    _ => (at, at),
+                };
+                self.sel = Some(Selection {
+                    anchor,
+                    head,
+                    dragging: true,
+                    copy: count > 1,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(at) = self.point(m.column, m.row, true) else {
+                    return false;
+                };
+                let Some(sel) = &mut self.sel else {
+                    return false;
+                };
+                if !sel.dragging {
+                    return false;
+                }
+                sel.head = at;
+                sel.copy |= sel.head != sel.anchor;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(sel) = &mut self.sel else {
+                    return false;
+                };
+                sel.dragging = false;
+                if !sel.copy {
+                    // a click, not a selection
+                    self.sel = None;
+                    return true;
+                }
+                self.copy_selection();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The transcript's line and column at a cell of the screen, if it is in
+    /// the transcript; when `dragging` past its top or bottom, the line
+    /// beyond, the transcript scrolled to it
+    fn point(&mut self, x: u16, y: u16, dragging: bool) -> Option<(usize, usize)> {
+        let (area, start) = self.view;
+        let total = self.last_total;
+        if total == 0 || area.height == 0 {
+            return None;
+        }
+        let col = x.saturating_sub(area.x).min(area.width.saturating_sub(1)) as usize;
+        let line = if y < area.y {
+            if !dragging {
+                return None;
+            }
+            self.scroll += 1;
+            start.saturating_sub(1)
+        } else if y >= area.y + area.height {
+            if !dragging {
+                return None;
+            }
+            self.scroll = self.scroll.saturating_sub(1);
+            start + area.height as usize
+        } else {
+            start + (y - area.y) as usize
+        };
+        Some((line.min(total - 1), col))
+    }
+
+    /// Line `i` of the transcript, as last drawn
+    fn line(&self, i: usize) -> Option<&Line<'static>> {
+        let mut pos = 0;
+        for (_, lines) in self.order.iter().filter_map(|&j| self.cache[j].as_ref()) {
+            if i < pos + lines.len() {
+                return lines.get(i - pos);
+            }
+            pos += lines.len();
+        }
+        None
+    }
+
+    fn line_width(&self, i: usize) -> usize {
+        self.line(i).map_or(0, |l| width(&plain(l)))
+    }
+
+    /// The columns of the word at `at`: a run of anything but spaces and
+    /// brackets, quotes and punctuation that ends a path
+    fn word(&self, at: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+        let text = self.line(at.0).map(plain).unwrap_or_default();
+        let is_word = |c: char| !c.is_whitespace() && !"()[]{}<>\"'`,;|│".contains(c);
+        // each character with its first column
+        let mut cells = Vec::new();
+        let mut col = 0;
+        for c in text.chars() {
+            cells.push((col, c));
+            col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+        let Some(i) = cells.iter().rposition(|&(c, _)| c <= at.1) else {
+            return (at, at);
+        };
+        if !is_word(cells[i].1) {
+            return (at, at);
+        }
+        let mut a = i;
+        while a > 0 && is_word(cells[a - 1].1) {
+            a -= 1;
+        }
+        let mut b = i;
+        while b + 1 < cells.len() && is_word(cells[b + 1].1) {
+            b += 1;
+        }
+        let end = cells[b].0 + unicode_width::UnicodeWidthChar::width(cells[b].1).unwrap_or(1);
+        ((at.0, cells[a].0), (at.0, end.saturating_sub(1)))
+    }
+
+    /// The text selected, a line of the transcript per line
+    fn selected_text(&self) -> String {
+        let Some(sel) = &self.sel else {
+            return String::new();
+        };
+        let ((l0, c0), (l1, c1)) = sel.range();
+        let mut out = Vec::new();
+        for i in l0..=l1 {
+            let text = self.line(i).map(plain).unwrap_or_default();
+            let a = if i == l0 { c0 } else { 0 };
+            let b = if i == l1 { c1 + 1 } else { usize::MAX };
+            out.push(columns(&text, a, b).trim_end().to_string());
+        }
+        out.join("\n")
+    }
+
+    fn copy_selection(&mut self) {
+        let text = self.selected_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        match (self.clipboard)(&text) {
+            Ok(how) => {
+                let n = text.chars().count();
+                self.notify(format!(
+                    "copied {n} character{} with {how}",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Err(e) => self.notify(format!("can't copy: {e}")),
+        }
+        self.copied = text;
+    }
+
     fn draw_transcript(&mut self, f: &mut Frame, area: Rect) {
         let w = area.width as usize;
         let h = area.height as usize;
@@ -1542,7 +1728,28 @@ impl App {
                 break;
             }
         }
+        self.view = (area, start);
+        let widths: Vec<usize> = lines.iter().map(|l| width(&plain(l))).collect();
         f.render_widget(Paragraph::new(lines), area);
+        // the selection, in reverse video
+        if let Some(sel) = &self.sel {
+            let ((l0, c0), (l1, c1)) = sel.range();
+            for (r, lw) in widths.iter().enumerate() {
+                let line = start + r;
+                if line < l0 || line > l1 {
+                    continue;
+                }
+                let a = if line == l0 { c0 } else { 0 };
+                let b = if line == l1 { c1 + 1 } else { (*lw).max(1) };
+                let b = b.min(w);
+                if b > a {
+                    f.buffer_mut().set_style(
+                        Rect::new(area.x + a as u16, area.y + r as u16, (b - a) as u16, 1),
+                        Style::new().add_modifier(Modifier::REVERSED),
+                    );
+                }
+            }
+        }
         if self.scroll > 0 {
             let tag = format!(" ↓ {} more lines (esc) ", self.scroll);
             let tw = width(&tag) as u16;
@@ -1991,6 +2198,50 @@ fn render_diff(
     }
 }
 
+/// Text selected in the transcript, from where the button was pressed to
+/// where it is: lines and columns of the transcript, both ends included
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    /// the button is still down
+    dragging: bool,
+    /// it is a selection, not a click: copied when the button is released
+    copy: bool,
+}
+
+impl Selection {
+    /// Its first and last cells
+    fn range(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// The text of a line, without its styles
+fn plain(line: &Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// The characters of `text` that start in columns `a` to `b`, `b` excluded
+fn columns(text: &str, a: usize, b: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if col >= b {
+            break;
+        }
+        if col >= a {
+            out.push(c);
+        }
+        col += w;
+    }
+    out
+}
+
 /// A duration as listed: `42s`, `3m05s`, `1h20m`
 fn elapsed(d: Duration) -> String {
     let s = d.as_secs();
@@ -2407,5 +2658,102 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.ps.is_none());
         assert!(!screen(&mut app, 100, 20).contains("Shell commands running"));
+    }
+
+    #[test]
+    fn select_and_copy() {
+        let (cmd, _cmds) = channel();
+        let (own, _) = channel();
+        let opts = Options {
+            cwd: "/work/proj".into(),
+            thinking: true,
+            accept_all: false,
+            mouse: true,
+            theme: Theme::default(),
+            procs: Procs::default(),
+        };
+        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+        // not the system's, in a test
+        app.clipboard = |_| Ok("test");
+        app.message(Msg::Idle);
+        app.message(Msg::Info("alpha beta gamma".into()));
+        app.message(Msg::Info("see src/ui/mod.rs:42 for it".into()));
+        app.message(Msg::Info("last one".into()));
+        let shown = screen(&mut app, 60, 20);
+        println!("{shown}");
+        // the cell where `text` starts on the screen
+        let at = |text: &str| -> (u16, u16) {
+            let (y, line) = shown
+                .lines()
+                .enumerate()
+                .find(|(_, l)| l.contains(text))
+                .unwrap_or_else(|| panic!("{text} not shown"));
+            let x = width(&line[..line.find(text).unwrap()]);
+            (x as u16, y as u16)
+        };
+        let mouse = |app: &mut App, kind, (x, y): (u16, u16)| {
+            app.mouse(MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        let left = MouseButton::Left;
+
+        // a drag, its last cell included
+        let (x, y) = at("beta");
+        mouse(&mut app, MouseEventKind::Down(left), (x, y));
+        mouse(&mut app, MouseEventKind::Drag(left), (x + 9, y));
+        mouse(&mut app, MouseEventKind::Up(left), (x + 9, y));
+        assert_eq!(app.copied, "beta gamma");
+        // shown in reverse video
+        let mut t = ratatui::Terminal::new(TestBackend::new(60, 20)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let reversed = |x: u16| t.backend().buffer()[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!(reversed(x) && reversed(x + 9) && !reversed(x + 10) && !reversed(x - 1));
+
+        // a double click: a path, with its line number
+        let (x, y) = at("mod.rs");
+        for _ in 0..2 {
+            mouse(&mut app, MouseEventKind::Down(left), (x, y));
+            mouse(&mut app, MouseEventKind::Up(left), (x, y));
+        }
+        assert_eq!(app.copied, "src/ui/mod.rs:42");
+
+        // a triple click: the line
+        std::thread::sleep(Duration::from_millis(450));
+        for _ in 0..3 {
+            mouse(&mut app, MouseEventKind::Down(left), (x, y));
+            mouse(&mut app, MouseEventKind::Up(left), (x, y));
+        }
+        assert!(app.copied.ends_with("see src/ui/mod.rs:42 for it"), "{:?}", app.copied);
+
+        // over several lines, upwards
+        let (x0, y0) = at("gamma");
+        let (x1, y1) = at("last");
+        mouse(&mut app, MouseEventKind::Down(left), (x1 + 3, y1));
+        mouse(&mut app, MouseEventKind::Drag(left), (x0, y0));
+        mouse(&mut app, MouseEventKind::Up(left), (x0, y0));
+        assert!(app.copied.starts_with("gamma\n"), "{:?}", app.copied);
+        assert!(app.copied.contains("see src/ui/mod.rs:42 for it\n"), "{:?}", app.copied);
+        assert!(app.copied.ends_with("last"), "{:?}", app.copied);
+
+        // a click clears the selection, copies nothing
+        std::thread::sleep(Duration::from_millis(450));
+        let before = app.copied.clone();
+        mouse(&mut app, MouseEventKind::Down(left), (x0, y0));
+        mouse(&mut app, MouseEventKind::Up(left), (x0, y0));
+        assert!(app.sel.is_none());
+        assert_eq!(app.copied, before);
+    }
+
+    #[test]
+    fn text_by_columns() {
+        assert_eq!(columns("hello world", 6, 11), "world");
+        assert_eq!(columns("hello", 3, usize::MAX), "lo");
+        // a wide character takes two columns
+        assert_eq!(columns("a漢b", 1, 3), "漢");
+        assert_eq!(columns("a漢b", 3, 4), "b");
     }
 }

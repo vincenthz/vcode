@@ -59,7 +59,8 @@ usage: vcode [options] [directory]
   -l, --lookup <n>         tokens proposed per step from the conversation, which
                            speeds up edits that copy code, 0 to disable [default: 7]
       --temp <f>           sampling temperature [default: the model's]
-      --no-mouse           leave the mouse to the terminal (text selection)
+      --no-mouse           leave the mouse to the terminal, rather than scroll
+                           and select in vcode
       --trace <file>       trace the prompts, tokens and tool calls of the
                            agents to a file (also /debug <file>, /debug off)
   -h, --help
