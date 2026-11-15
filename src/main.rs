@@ -1,6 +1,7 @@
 //! vcode: a terminal coding agent, with a Qwen model running locally on biv.
 
 mod agent;
+mod procs;
 mod prompt;
 mod roles;
 mod tools;
@@ -90,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
             temperature: None,
             cwd: std::env::current_dir().map_err(|e| e.to_string())?,
             parallel: 4,
+            procs: procs::Procs::default(),
         },
         prompt: None,
         yolo: false,
@@ -167,12 +169,15 @@ fn main() {
         std::process::exit(2);
     }
     let stop = Arc::new(AtomicBool::new(false));
+    let procs = args.cfg.procs.clone();
     let (cmd_tx, cmd_rx) = channel();
     let (msg_tx, msg_rx) = channel();
     agent::spawn(args.cfg.clone(), cmd_rx, msg_tx.clone(), stop.clone());
 
     if let Some(prompt) = args.prompt {
         let status = headless(&prompt, args.yolo, cmd_tx, msg_rx);
+        // what commands left running in the background
+        procs.kill_all();
         trace::stop();
         std::process::exit(status);
     }
@@ -182,8 +187,11 @@ fn main() {
         accept_all: args.yolo,
         mouse: args.mouse,
         theme: ui::themes::Theme::default(),
+        procs: procs.clone(),
     };
     let result = ui::run(opts, cmd_tx, msg_tx, msg_rx, stop);
+    // the commands running, and those left in the background
+    procs.kill_all();
     // the tokens not written yet
     trace::stop();
     if let Err(e) = result {

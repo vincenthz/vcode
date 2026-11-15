@@ -128,8 +128,13 @@ conversation is compacted.
 - pgup/pgdn or the mouse wheel scroll (`--no-mouse` leaves the mouse to the terminal, for selecting text)
 - up/down go through the history
 - `!cmd` runs a shell command; its output goes to the model with your next message
+- ctrl+p (or `/ps`) lists the shell commands running, the agents' and yours:
+  ↑/↓ select, `k` kills one with everything it started, esc closes. A command
+  whose shell exits but leaves processes running (`npm run dev &`) returns to
+  the model and stays listed, in the background, until they end or are
+  killed; the status line counts them. Quitting vcode kills them all
 
-Commands: `/clear`, `/compact` (replace the conversation with the model's
+Commands: `/clear`, `/ps`, `/compact` (replace the conversation with the model's
 summary of it, which also happens by itself at 80% of the context), `/pilot`,
 `/think`, `/nothink`, `/mode`, `/context`, `/help`, `/quit`.
 
@@ -148,6 +153,7 @@ tasks that start from then on. Sizes are tokens, or with `k` or `m`.
 | `src/agent.rs` | the agent thread: owns the model and the chats (main, subagents), the batch scheduler, runs the tool loops and the subagents' threads, compaction |
 | `src/roles.rs` | the kinds of subagents: instructions, tools |
 | `src/tools.rs` | tool definitions (as the chat template's `tojson` writes them), planning (argument checks, diffs) and running |
+| `src/procs.rs` | the shell commands running, listed and killed from the interface |
 | `src/prompt.rs` | the system prompts: agent, pilot, subagents |
 | `src/ui/mod.rs` | the ratatui interface: transcript, approvals, status |
 | `src/ui/text.rs` | word wrapping, a little Markdown |

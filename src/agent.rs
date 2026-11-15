@@ -62,6 +62,8 @@ pub struct Config {
     /// subagents working at the same time at most, their passes batched; 1
     /// for one after the other, on the engine itself
     pub parallel: usize,
+    /// the shell commands running, which the interface lists and can kill
+    pub procs: crate::procs::Procs,
 }
 
 /// From the interface to the agent
@@ -398,6 +400,8 @@ fn session<'m>(
             env: Env {
                 cwd: cfg.cwd.clone(),
                 stop: stop.clone(),
+                procs: cfg.procs.clone(),
+                owner: "agent".into(),
             },
             stop,
             ids: Arc::new(AtomicUsize::new(0)),
@@ -975,13 +979,16 @@ impl<'m> Worker<'m> {
         Ok(())
     }
 
-    /// What the worker of the subagent doing the task of call `task` is made of
-    fn seed(&self, task: usize, agent: usize) -> Seed {
+    /// What the worker of the subagent doing `task` is made of
+    fn seed(&self, task: &Started) -> Seed {
+        let (agent, task, role) = (task.agent, task.id, task.role);
         Seed {
             tx: self.tx.clone(),
             env: Env {
                 cwd: self.env.cwd.clone(),
                 stop: self.stop.clone(),
+                procs: self.env.procs.clone(),
+                owner: format!("{} #{task}", role.name()),
             },
             ids: self.ids.clone(),
             sampling: SamplerConfig {
@@ -1004,7 +1011,7 @@ impl<'m> Worker<'m> {
                 let opts = self
                     .task_options(t.role)
                     .expect("tasks only with subagents");
-                (self.seed(t.id, t.agent), opts, &self.roles[&t.role], t)
+                (self.seed(t), opts, &self.roles[&t.role], t)
             })
             .collect();
         let shared = self.shared.filter(|_| jobs.len() > 1);

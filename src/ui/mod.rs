@@ -28,11 +28,12 @@ use ratatui::{DefaultTerminal, Frame};
 use themes::Theme;
 
 use crate::agent::{Cmd, Decision, Msg};
+use crate::procs::{Info, Procs};
 use crate::tools::{DiffLine, Kind, Tool, clip};
 use input::Input;
 use text::{markdown, width, wrap, wrap_plain};
 
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 13] = [
     ("/help", "keys and commands"),
     ("/clear", "start a new conversation"),
     (
@@ -55,6 +56,10 @@ const COMMANDS: [(&str, &str); 12] = [
         "change the color theme: /theme nord, /theme dracula, /theme catppuccin, /theme monokai, /theme onedark, /theme gruvbox, /theme default (also shift+ctrl+t)",
     ),
     (
+        "/ps",
+        "the shell commands running, to kill one (also ctrl+p)",
+    ),
+    (
         "/debug",
         "trace prompts, tokens and tool calls to a file: /debug <file>, /debug off",
     ),
@@ -67,12 +72,15 @@ enter send · shift+enter, alt+enter, ctrl+j or \\ then enter: new line
 esc interrupt · ctrl+c interrupt, clear, or quit · ctrl+d quit
 shift+tab permission mode · ctrl+t show reasoning · shift+ctrl+t cycle theme
 ctrl+o expand tool output · pgup/pgdn or the mouse wheel scroll
+ctrl+p the shell commands running: ↑↓ select, k kill, esc close
 !<command> runs a shell command; its output goes with your next message";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const OUTPUT_LINES: usize = 5;
 const DIFF_LINES: usize = 40;
 const MAX_TOOL_OUTPUT: usize = 256 * 1024;
+/// Shell commands shown at once in their list
+const PS_ROWS: usize = 8;
 
 /// A shortcut for building a themed style.
 macro_rules! themed {
@@ -182,6 +190,8 @@ pub struct Options {
     pub accept_all: bool,
     pub mouse: bool,
     pub theme: Theme,
+    /// the shell commands running
+    pub procs: Procs,
 }
 
 struct App {
@@ -197,6 +207,11 @@ struct App {
     own: Sender<Msg>,
     stop: Arc<AtomicBool>,
     cwd: PathBuf,
+    /// the shell commands running
+    procs: Procs,
+    /// the list of the shell commands is open, at the one selected (its id,
+    /// 0 for the first)
+    ps: Option<usize>,
 
     phase: Phase,
     busy_since: Option<Instant>,
@@ -287,6 +302,8 @@ impl App {
             own,
             stop,
             cwd: opts.cwd,
+            procs: opts.procs,
+            ps: None,
             phase: Phase::Loading,
             busy_since: None,
             status: "starting".into(),
@@ -327,8 +344,15 @@ impl App {
         let mut dirty = true;
         let mut last_draw = Instant::now();
         while !self.quit {
-            let animating = self.busy();
-            if dirty || (animating && last_draw.elapsed() >= Duration::from_millis(100)) {
+            // the spinner, or the commands running (their time, their output)
+            let every = if self.busy() {
+                Some(Duration::from_millis(100))
+            } else if self.ps.is_some() || !self.procs.is_empty() {
+                Some(Duration::from_millis(500))
+            } else {
+                None
+            };
+            if dirty || every.is_some_and(|e| last_draw.elapsed() >= e) {
                 terminal.draw(|f| self.draw(f))?;
                 last_draw = Instant::now();
                 dirty = false;
@@ -768,7 +792,13 @@ impl App {
             return;
         }
 
+        if self.ps.is_some() {
+            self.ps_key(k);
+            return;
+        }
+
         match k.code {
+            KeyCode::Char('p') if ctrl => self.ps = Some(0),
             KeyCode::Char('c') if ctrl => {
                 if self.busy() && self.phase != Phase::Loading {
                     self.interrupt();
@@ -1034,6 +1064,7 @@ impl App {
                     },
                 }
             }
+            "/ps" | "/jobs" => self.ps = Some(0),
             "/debug" => self.debug(line[name.len()..].trim()),
             _ => self.notify(format!("unknown command {name}, /help lists them")),
         }
@@ -1077,8 +1108,9 @@ impl App {
         });
         let own = self.own.clone();
         let cwd = self.cwd.clone();
+        let procs = self.procs.clone();
         std::thread::spawn(move || {
-            let out = crate::tools::shell(&cwd, &cmd);
+            let out = crate::tools::shell(&cwd, &cmd, &procs);
             let _ = own.send(Msg::Shell {
                 entry,
                 ok: out.ok,
@@ -1094,8 +1126,11 @@ impl App {
         let w = area.width as usize;
         let input_cols = w.saturating_sub(4);
         let (rows, cursor) = self.input.layout(input_cols);
+        let procs = self.ps.map(|_| self.procs.list());
         let input_h = if self.permission.is_some() {
             4
+        } else if let Some(procs) = &procs {
+            procs.len().clamp(1, PS_ROWS) as u16 + 3
         } else {
             rows.len().clamp(1, 10) as u16 + 2
         };
@@ -1144,6 +1179,8 @@ impl App {
 
         if self.permission.is_some() {
             self.draw_permission(f, input_area);
+        } else if let Some(procs) = &procs {
+            self.draw_ps(f, input_area, procs);
         } else {
             let block = Block::new()
                 .borders(Borders::TOP | Borders::BOTTOM)
@@ -1270,15 +1307,34 @@ impl App {
         );
         let mode = Span::styled(format!("  ⏵ {}", self.mode.label()), mode_style);
         let hint = Span::styled(" (shift+tab)", DIM);
+        let running = self.procs.list();
+        let shells = Span::styled(
+            match running.len() {
+                0 => String::new(),
+                1 => "1 shell (ctrl+p) · ".into(),
+                n => format!("{n} shells (ctrl+p) · "),
+            },
+            if running.iter().any(|p| p.background) {
+                themed!(self, Yellow)
+            } else {
+                DIM
+            },
+        );
         // what fits, dropping the least useful first
         let candidates = [
             (
                 vec![mode.clone(), hint.clone()],
-                vec![pilot.clone(), model.clone(), ctx.clone()],
+                vec![shells.clone(), pilot.clone(), model.clone(), ctx.clone()],
             ),
-            (vec![mode.clone()], vec![pilot.clone(), model, ctx.clone()]),
-            (vec![mode.clone()], vec![pilot.clone(), ctx.clone()]),
-            (vec![], vec![pilot, ctx]),
+            (
+                vec![mode.clone()],
+                vec![shells.clone(), pilot.clone(), model, ctx.clone()],
+            ),
+            (
+                vec![mode.clone()],
+                vec![shells.clone(), pilot.clone(), ctx.clone()],
+            ),
+            (vec![], vec![shells, pilot, ctx]),
         ];
         let span_w = |v: &[Span]| v.iter().map(|s| width(&s.content)).sum::<usize>();
         let (left, right) = candidates
@@ -1339,6 +1395,113 @@ impl App {
                 Span::raw(" no, and stop"),
             ]),
         ];
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The keys of the list of the shell commands running
+    fn ps_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let procs = self.procs.list();
+        let at = self.ps_selected(&procs);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.ps = None,
+            KeyCode::Char('p' | 'c') if ctrl => self.ps = None,
+            KeyCode::Up => {
+                if let Some(p) = at.and_then(|i| procs.get(i.saturating_sub(1))) {
+                    self.ps = Some(p.id);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = at.and_then(|i| procs.get(i + 1)) {
+                    self.ps = Some(p.id);
+                }
+            }
+            KeyCode::Char('k' | 'x') | KeyCode::Delete => {
+                if let Some(p) = at.map(|i| &procs[i])
+                    && self.procs.kill(p.id)
+                {
+                    self.notify(format!("killed {}", clip(&p.command, 50)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The position of the command selected in the list, the first if it ended
+    fn ps_selected(&self, procs: &[Info]) -> Option<usize> {
+        if procs.is_empty() {
+            return None;
+        }
+        let id = self.ps.unwrap_or(0);
+        Some(procs.iter().position(|p| p.id == id).unwrap_or(0))
+    }
+
+    fn draw_ps(&self, f: &mut Frame, area: Rect, procs: &[Info]) {
+        let block = Block::bordered()
+            .padding(ratatui::widgets::Padding::horizontal(1))
+            .border_style(themed!(self, Cyan))
+            .title(Span::styled(
+                format!(" Shell commands running ({}) ", procs.len()),
+                themed!(self, CyanBold),
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let w = inner.width as usize;
+        let key = |k: &str| Span::styled(k.to_string(), themed!(self, CyanBold));
+        let mut lines = Vec::new();
+        let at = self.ps_selected(procs).unwrap_or(0);
+        // the selected one in view
+        let first = at.saturating_sub(PS_ROWS - 1);
+        if procs.is_empty() {
+            lines.push(Line::styled("none", DIM));
+        }
+        for (i, p) in procs.iter().enumerate().skip(first).take(PS_ROWS) {
+            let selected = i == at;
+            let (state, style) = match (p.killed, p.background) {
+                (true, _) => ("killing", themed!(self, Red)),
+                (false, true) => ("background", themed!(self, Yellow)),
+                (false, false) => ("running", DIM),
+            };
+            let head = format!(
+                "{} {:>6}  {:<12} ",
+                if selected { "›" } else { " " },
+                elapsed(p.elapsed),
+                clip(&p.owner, 12),
+            );
+            let state = format!(" {state}");
+            let room = w.saturating_sub(width(&head) + width(&state));
+            let command = clip(p.command.lines().next().unwrap_or(""), room);
+            // the last line of its output, in what is left
+            let left = room.saturating_sub(width(&command) + 3);
+            let last = if p.last.is_empty() || left < 8 {
+                String::new()
+            } else {
+                format!(" · {}", clip(&p.last, left.saturating_sub(1)))
+            };
+            let pad = w.saturating_sub(
+                width(&head) + width(&command) + width(&last) + width(&state),
+            );
+            let bold = if selected {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(head, if selected { themed!(self, CyanBold) } else { DIM }),
+                Span::styled(command, bold),
+                Span::styled(last, DIM),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(state, style),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            key("↑↓"),
+            Span::raw(" select  "),
+            key("k"),
+            Span::raw(" kill, with what it started  "),
+            key("esc"),
+            Span::raw(" close"),
+        ]));
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1828,6 +1991,16 @@ fn render_diff(
     }
 }
 
+/// A duration as listed: `42s`, `3m05s`, `1h20m`
+fn elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s / 60 % 60),
+    }
+}
+
 fn kilo(n: usize) -> String {
     if n >= 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
@@ -1875,6 +2048,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             theme: Theme::default(),
+            procs: Procs::default(),
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Ready {
@@ -1958,6 +2132,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             theme: Theme::default(),
+            procs: Procs::default(),
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
@@ -2016,6 +2191,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             theme: Theme::default(),
+            procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
         let mut run = |app: &mut App, line: &str| {
@@ -2064,6 +2240,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             theme: Theme::default(),
+            procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
         let sub = |task: usize, m: Msg| Msg::Sub {
@@ -2162,6 +2339,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             theme: Theme::default(),
+            procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Pilot(true));
         app.message(Msg::Idle);
@@ -2175,5 +2353,59 @@ mod tests {
         assert!(out.contains("Plan  1/4 done"));
         assert!(out.contains("◐ add variance"));
         assert!(out.contains("pilot · plan 1/4"));
+    }
+
+    #[test]
+    fn shell_commands_listed_and_killed() {
+        let (cmd, _cmds) = channel();
+        let (own, _) = channel();
+        let procs = Procs::default();
+        let opts = Options {
+            cwd: "/work/proj".into(),
+            thinking: true,
+            accept_all: false,
+            mouse: false,
+            theme: Theme::default(),
+            procs: procs.clone(),
+        };
+        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+        app.message(Msg::Idle);
+        // a real process, in a group of its own as the bash tool makes them
+        let mut child = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        procs.add("npm run dev", "you", 1 << 30); // never killed: not selected
+        let job = procs.add("sleep 30", "explore #3", child.id());
+        job.set_background();
+        job.out.lock().unwrap().push(b"listening on :3000\n");
+        assert!(screen(&mut app, 100, 20).contains("2 shells (ctrl+p)"));
+
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let shown = screen(&mut app, 100, 20);
+        println!("{shown}");
+        assert!(shown.contains("Shell commands running (2)"));
+        assert!(shown.contains("› "));
+        let line = shown.lines().find(|l| l.contains("sleep 30")).unwrap();
+        assert!(line.contains("› ") && line.contains("explore #3"), "{line}");
+        assert!(line.contains("listening on :3000") && line.contains("background"), "{line}");
+
+        // typing goes to the list, not the input
+        app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        let t = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            assert!(t.elapsed() < Duration::from_secs(5), "not killed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(screen(&mut app, 100, 20).contains("killing"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.ps.is_none());
+        assert!(!screen(&mut app, 100, 20).contains("Shell commands running"));
     }
 }

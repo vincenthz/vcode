@@ -8,12 +8,13 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use biv::chat::ToolCall;
 
+use crate::procs::Procs;
 use crate::roles::Role;
 use similar::{ChangeTag, TextDiff};
 
@@ -118,6 +119,9 @@ const READ_LINES: usize = 400;
 const MAX_LINE: usize = 500;
 /// Matches of grep, files of glob, entries of list_dir
 const MAX_RESULTS: usize = 200;
+/// How long the output of a command whose shell exited may still come,
+/// before what holds it open is taken for processes left in the background
+const BACKGROUND_AFTER: Duration = Duration::from_millis(300);
 
 /// What approving a call allows
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -196,6 +200,10 @@ pub struct Env {
     pub cwd: PathBuf,
     /// set to interrupt a running command
     pub stop: Arc<AtomicBool>,
+    /// where its commands are listed while they run
+    pub procs: Procs,
+    /// who runs them, as listed: `agent`, `explore #12`, `you`
+    pub owner: String,
 }
 
 fn arg<'a>(call: &'a ToolCall, name: &str) -> Option<&'a str> {
@@ -484,7 +492,7 @@ impl Env {
             Ok(c) => c,
             Err(e) => return failure(format!("{shell}: {e}")),
         };
-        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let job = self.procs.add(command, &self.owner, child.id());
         let readers: Vec<_> = [
             child
                 .stdout
@@ -498,21 +506,29 @@ impl Env {
         .into_iter()
         .flatten()
         .map(|mut pipe| {
-            let output = output.clone();
+            let job = job.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 while let Ok(n) = pipe.read(&mut buf) {
                     if n == 0 {
                         break;
                     }
-                    output.lock().unwrap().extend_from_slice(&buf[..n]);
+                    job.out.lock().unwrap().push(&buf[..n]);
                 }
             })
         })
         .collect();
 
-        let start = Instant::now();
+        let start = job.start;
         let mut sent = 0;
+        let mut stream = |progress: &mut dyn FnMut(&str)| {
+            let out = job.out.lock().unwrap();
+            let head = out.head();
+            if head.len() > sent {
+                progress(&String::from_utf8_lossy(&head[sent..]));
+                sent = head.len();
+            }
+        };
         let mut killed = None;
         let status = loop {
             match child.try_wait() {
@@ -523,40 +539,84 @@ impl Env {
             if killed.is_none() {
                 if self.stop.load(Ordering::SeqCst) {
                     killed = Some("interrupted by the user");
+                } else if job.killed() {
+                    killed = Some("killed by the user");
                 } else if start.elapsed() > timeout {
                     killed = Some("timed out");
                 }
                 if killed.is_some() {
-                    kill(&mut child);
+                    job.kill();
+                    // the shell itself, in case it left its group
+                    let _ = child.kill();
                 }
             }
-            {
-                let out = output.lock().unwrap();
-                if out.len() > sent {
-                    progress(&String::from_utf8_lossy(&out[sent..]));
-                    sent = out.len();
-                }
-            }
+            stream(progress);
             std::thread::sleep(Duration::from_millis(30));
         };
-        for r in readers {
-            let _ = r.join();
+        // killed from the list as it exited
+        if killed.is_none() && job.killed() {
+            killed = Some("killed by the user");
         }
-        let out = output.lock().unwrap();
-        if out.len() > sent {
-            progress(&String::from_utf8_lossy(&out[sent..]));
+        // the shell is gone, but processes it started may hold its output
+        // open (`server &`): they go on in the background, still listed
+        let grace = Instant::now();
+        while !readers.iter().all(|r| r.is_finished()) && grace.elapsed() < BACKGROUND_AFTER {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let text = strip_ansi(&String::from_utf8_lossy(&out));
+        let background = !readers.iter().all(|r| r.is_finished());
+        if background {
+            job.set_background();
+            let procs = self.procs.clone();
+            let job = job.clone();
+            std::thread::spawn(move || {
+                let mut since_kill = None;
+                while !readers.iter().all(|r| r.is_finished()) {
+                    // killed, yet the output still held: by a process that
+                    // left the group; it isn't listed any longer
+                    if job.killed()
+                        && since_kill.get_or_insert_with(Instant::now).elapsed()
+                            > Duration::from_secs(2)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                procs.remove(job.id);
+            });
+        } else {
+            for r in readers {
+                let _ = r.join();
+            }
+            self.procs.remove(job.id);
+        }
+        stream(progress);
+        let text = strip_ansi(&job.out.lock().unwrap().text());
         let text = text.trim_end();
         let code = status.and_then(|s| s.code());
         let mut result = middle_out(text, MAX_OUTPUT);
         let ok = killed.is_none() && code == Some(0);
-        let status = match (killed, code) {
+        let mut status = match (killed, code) {
             (Some(why), _) => format!("[{why} after {:.0}s]", start.elapsed().as_secs_f64()),
             (None, Some(0)) => String::new(),
             (None, Some(c)) => format!("[exit code {c}]"),
             (None, None) => "[killed by a signal]".into(),
         };
+        let lines = text.lines().count();
+        let mut summary = match (status.is_empty(), lines) {
+            (true, 0) => "no output".into(),
+            (true, n) => format!("{n} lines"),
+            (false, _) => status.trim_matches(['[', ']']).to_string(),
+        };
+        if background && killed.is_none() {
+            if !status.is_empty() {
+                status.push('\n');
+            }
+            status.push_str(
+                "[processes it started are still running in the background; their later output \
+                 is not shown; the user can list and stop them]",
+            );
+            summary.push_str(" · still running in the background (ctrl+p)");
+        }
         if !status.is_empty() {
             if !result.is_empty() {
                 result.push('\n');
@@ -566,13 +626,8 @@ impl Env {
         if result.is_empty() {
             result = "(no output)".into();
         }
-        let lines = text.lines().count();
         Output {
-            summary: match (status.is_empty(), lines) {
-                (true, 0) => "no output".into(),
-                (true, n) => format!("{n} lines"),
-                (false, _) => status.trim_matches(['[', ']']).to_string(),
-            },
+            summary,
             text: result,
             ok,
         }
@@ -745,11 +800,14 @@ pub fn plan_request(call: &ToolCall) -> Result<(String, String), String> {
     Ok((overview, tasks))
 }
 
-/// A command the user runs (`!`), in `cwd`
-pub fn shell(cwd: &Path, command: &str) -> Output {
+/// A command the user runs (`!`), in `cwd`: listed in `procs`, where it can
+/// be killed
+pub fn shell(cwd: &Path, command: &str, procs: &Procs) -> Output {
     let env = Env {
         cwd: cwd.to_path_buf(),
         stop: Arc::new(AtomicBool::new(false)),
+        procs: procs.clone(),
+        owner: "you".into(),
     };
     env.bash(command, Duration::from_secs(600), &mut |_| {})
 }
@@ -779,21 +837,6 @@ fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-}
-
-#[cfg(unix)]
-fn kill(child: &mut std::process::Child) {
-    // the whole process group, then the shell itself in case it left it
-    let _ = Command::new("kill")
-        .args(["-KILL", &format!("-{}", child.id())])
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill(child: &mut std::process::Child) {
-    let _ = child.kill();
 }
 
 /// `s` replaced by `with` in `text`: once, unless `all`
@@ -933,6 +976,8 @@ mod tests {
             Env {
                 cwd: dir.clone(),
                 stop: Arc::new(AtomicBool::new(false)),
+                procs: Procs::default(),
+                owner: "agent".into(),
             },
             dir,
         )
@@ -1069,6 +1114,71 @@ mod tests {
         );
         assert!(t.elapsed() < Duration::from_secs(5));
         assert!(out.text.contains("timed out"), "{}", out.text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Waits for `cond` 5 s at most
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn background_processes() {
+        let (env, dir) = env();
+        // the shell exits, its sleep holds the output open
+        let t = Instant::now();
+        let out = run(
+            &env,
+            call("bash", &[("command", "sleep 30 & echo started")]),
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(out.ok, "{}", out.text);
+        assert!(out.text.contains("started"), "{}", out.text);
+        assert!(out.text.contains("background"), "{}", out.text);
+        let list = env.procs.list();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].background);
+        assert_eq!(list[0].owner, "agent");
+        assert_eq!(list[0].last, "started");
+        // killed from the list, with its sleep
+        assert!(env.procs.kill(list[0].id));
+        assert!(eventually(|| env.procs.is_empty()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn killed_from_the_list() {
+        let (env, dir) = env();
+        let t = Instant::now();
+        let out = std::thread::scope(|s| {
+            let running = s.spawn(|| {
+                run(
+                    &env,
+                    call("bash", &[("command", "echo going; sleep 30; echo never")]),
+                )
+            });
+            assert!(eventually(|| env
+                .procs
+                .list()
+                .first()
+                .is_some_and(|p| p.last == "going")));
+            let id = env.procs.list()[0].id;
+            assert!(env.procs.kill(id));
+            running.join().unwrap()
+        });
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(!out.ok);
+        assert!(out.text.contains("going"), "{}", out.text);
+        assert!(!out.text.contains("never"), "{}", out.text);
+        assert!(out.text.contains("killed by the user"), "{}", out.text);
+        assert!(env.procs.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
