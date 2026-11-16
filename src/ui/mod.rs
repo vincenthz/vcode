@@ -2,6 +2,7 @@
 //! calls, the status line.
 
 mod clipboard;
+mod desktop;
 mod input;
 mod text;
 pub mod themes;
@@ -35,7 +36,7 @@ use crate::tools::{DiffLine, Kind, Tool, clip};
 use input::Input;
 use text::{markdown, width, wrap, wrap_plain};
 
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 15] = [
     ("/help", "keys and commands"),
     ("/clear", "start a new conversation"),
     (
@@ -64,6 +65,10 @@ const COMMANDS: [(&str, &str); 14] = [
     (
         "/bell",
         "ring the terminal's bell when an approval waits or a long answer ends, while you're elsewhere: on or off",
+    ),
+    (
+        "/notify",
+        "desktop notifications, at the same times as the bell: on or off",
     ),
     (
         "/debug",
@@ -203,6 +208,8 @@ pub struct Options {
     pub procs: Procs,
     /// ring the bell when the user is needed
     pub bell: bool,
+    /// and show a desktop notification
+    pub desktop: bool,
 }
 
 struct App {
@@ -266,6 +273,10 @@ struct App {
     focused: Option<bool>,
     /// the bell is to ring, after this round of messages
     ring: bool,
+    /// show desktop notifications too
+    desktop: bool,
+    /// the desktop notification to show, after this round of messages
+    note: Option<String>,
 
     /// lines from the bottom of the transcript, 0 to follow it
     scroll: usize,
@@ -370,6 +381,8 @@ impl App {
             bell: opts.bell,
             focused: None,
             ring: false,
+            desktop: opts.desktop,
+            note: None,
             scroll: 0,
             last_total: 0,
             page: 20,
@@ -439,6 +452,10 @@ impl App {
                 let mut out = stdout();
                 let _ = out.write_all(b"\x07").and_then(|_| out.flush());
             }
+            if let Some(note) = self.note.take() {
+                let dir = self.cwd.file_name().unwrap_or_default().to_string_lossy();
+                desktop::send(&format!("vcode · {dir}"), &note);
+            }
             if let Some((_, t)) = &self.notice
                 && t.elapsed() > Duration::from_secs(3)
             {
@@ -484,12 +501,42 @@ impl App {
         self.cache.iter_mut().for_each(|c| *c = None);
     }
 
-    /// The user is needed: ring the bell, unless they are looking (the
-    /// terminal has the focus) or don't want it. A terminal that doesn't
-    /// report its focus is taken as unattended.
-    fn alert(&mut self) {
-        if self.bell && self.focused != Some(true) {
-            self.ring = true;
+    /// The user is needed, for `why`: ring the bell, show a notification,
+    /// unless they are looking (the terminal has the focus) or don't want
+    /// it. A terminal that doesn't report its focus is taken as unattended.
+    fn alert(&mut self, why: impl FnOnce(&App) -> String) {
+        if self.focused == Some(true) {
+            return;
+        }
+        self.ring |= self.bell;
+        if self.desktop {
+            self.note = Some(why(self));
+        }
+    }
+
+    /// What the call being approved does
+    fn asking(&self) -> String {
+        let title = self
+            .permission
+            .as_ref()
+            .and_then(|(id, _)| self.tools.get(id))
+            .and_then(|&i| match &self.entries[i] {
+                Entry::Tool(t) => Some(t.title.as_str()),
+                _ => None,
+            })
+            .unwrap_or("a call");
+        format!("waiting for your approval: {title}")
+    }
+
+    /// A turn done, after `took`: with the start of the answer
+    fn answered(&self, took: Duration) -> String {
+        let answer = self.entries.iter().rev().find_map(|e| match e {
+            Entry::Answer(a) => a.lines().map(str::trim).find(|l| !l.is_empty()),
+            _ => None,
+        });
+        match answer {
+            Some(a) => format!("done in {}: {}", elapsed(took), a.replace(['*', '`'], "")),
+            None => format!("done in {}", elapsed(took)),
         }
     }
 
@@ -625,7 +672,7 @@ impl App {
                         self.phase = Phase::Asking;
                         // the change to approve must be in view
                         self.scroll = 0;
-                        self.alert();
+                        self.alert(App::asking);
                     }
                 }
                 self.touch(i);
@@ -662,12 +709,12 @@ impl App {
             Msg::Idle => {
                 self.phase = Phase::Idle;
                 // a long turn ended, not interrupted, with nothing more to do
-                let long = self.busy_since.is_some_and(|t| t.elapsed() >= BELL_AFTER);
-                self.busy_since = None;
+                let took = self.busy_since.take().map(|t| t.elapsed());
+                let long = took.is_some_and(|t| t >= BELL_AFTER);
                 if let Some(next) = self.queue.pop_front() {
                     self.submit(next);
                 } else if long && !self.stop.load(Ordering::SeqCst) {
-                    self.alert();
+                    self.alert(|app| app.answered(took.unwrap_or_default()));
                 }
             }
             Msg::Info(s) => {
@@ -679,7 +726,7 @@ impl App {
             Msg::Fatal(s) => {
                 self.phase = Phase::Dead;
                 self.status = "the model could not be loaded".into();
-                self.alert();
+                self.alert(|_| "the model could not be loaded".into());
                 self.touch(0);
                 self.push(Entry::Error(s));
             }
@@ -778,7 +825,7 @@ impl App {
                 self.phase = Phase::Asking;
                 self.scroll = 0;
                 self.touch(i);
-                self.alert();
+                self.alert(App::asking);
                 return;
             }
             self.touch(i);
@@ -1138,6 +1185,22 @@ impl App {
                     }
                 }
                 self.notify(if self.bell { "bell on" } else { "bell off" });
+            }
+            "/notify" => {
+                match line[name.len()..].trim() {
+                    "" => self.desktop = !self.desktop,
+                    "on" => self.desktop = true,
+                    "off" => self.desktop = false,
+                    a => {
+                        self.notify(format!("/notify on or off, not '{a}'"));
+                        return;
+                    }
+                }
+                self.notify(if self.desktop {
+                    "desktop notifications on"
+                } else {
+                    "desktop notifications off"
+                });
             }
             "/debug" => self.debug(line[name.len()..].trim()),
             _ => self.notify(format!("unknown command {name}, /help lists them")),
@@ -2358,6 +2421,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2443,6 +2507,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2503,6 +2568,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
@@ -2553,6 +2619,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
@@ -2653,6 +2720,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
@@ -2681,6 +2749,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: procs.clone(),
         };
@@ -2735,6 +2804,7 @@ mod tests {
             accept_all: false,
             mouse: true,
             bell: false,
+            desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2834,6 +2904,7 @@ mod tests {
             accept_all: false,
             mouse: false,
             bell: true,
+            desktop: true,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2860,25 +2931,42 @@ mod tests {
         // the focus unknown: an approval, a long turn ring; a short one doesn't
         ask(&mut app, 0);
         assert!(std::mem::take(&mut app.ring));
-        turn(&mut app, 30);
+        assert_eq!(
+            app.note.take().as_deref(),
+            Some("waiting for your approval: cargo test")
+        );
+        app.message(Msg::Answer("All **42 tests** pass.\n\nDetails…".into()));
+        turn(&mut app, 75);
         assert!(std::mem::take(&mut app.ring));
+        assert_eq!(
+            app.note.take().as_deref(),
+            Some("done in 1m15s: All 42 tests pass.")
+        );
         turn(&mut app, 2);
-        assert!(!app.ring);
+        assert!(!app.ring && app.note.is_none());
         // nor one interrupted
         stop.store(true, Ordering::SeqCst);
         turn(&mut app, 30);
-        assert!(!app.ring);
+        assert!(!app.ring && app.note.is_none());
         stop.store(false, Ordering::SeqCst);
 
         // the user looking: no bell
         app.focused = Some(true);
         ask(&mut app, 1);
         turn(&mut app, 30);
-        assert!(!app.ring);
+        assert!(!app.ring && app.note.is_none());
         // elsewhere: the bell
         app.focused = Some(false);
         ask(&mut app, 2);
         assert!(std::mem::take(&mut app.ring));
+        assert!(app.note.take().is_some());
+
+        // notifications off, the bell on
+        typed(&mut app, "/notify off");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        ask(&mut app, 4);
+        assert!(std::mem::take(&mut app.ring));
+        assert!(app.note.is_none());
 
         // turned off
         typed(&mut app, "/bell");

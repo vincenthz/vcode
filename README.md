@@ -144,10 +144,15 @@ conversation is compacted.
   (or doesn't say whether it has it); most terminals then flag the tab or
   bounce the dock icon, tmux marks the window. `/bell off` or `--no-bell`
   silence it
+- with `--notify` (or `/notify on`), a desktop notification says why at the
+  same times: "waiting for your approval: cargo test", "done in 1m15s: All
+  42 tests pass." It goes through the terminal when it shows them (iTerm2,
+  kitty, WezTerm, Ghostty, foot: this also works over ssh; in tmux, `set -g
+  allow-passthrough on`), else through `osascript` or `notify-send`
 
 Commands: `/clear`, `/ps`, `/compact` (replace the conversation with the model's
 summary of it, which also happens by itself at 80% of the context), `/pilot`,
-`/think`, `/nothink`, `/mode`, `/context`, `/bell`, `/help`, `/quit`.
+`/think`, `/nothink`, `/mode`, `/context`, `/bell`, `/notify`, `/help`, `/quit`.
 
 The context is 256k tokens by default (`-c`), at most the model's; a session
 allocates its whole KV cache up front, about 6.5 GB with the 35B-A3B at 256k.

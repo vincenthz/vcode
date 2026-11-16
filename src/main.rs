@@ -64,6 +64,9 @@ usage: vcode [options] [directory]
       --no-bell            don't ring the terminal's bell when an approval waits
                            or a long answer ends while you're elsewhere (also
                            /bell off)
+      --notify             show desktop notifications at those times too, through
+                           the terminal (iTerm2, kitty, WezTerm, Ghostty, foot)
+                           or the system (also /notify on, /notify off)
       --trace <file>       trace the prompts, tokens and tool calls of the
                            agents to a file (also /debug <file>, /debug off)
   -h, --help
@@ -77,6 +80,7 @@ struct Args {
     yolo: bool,
     mouse: bool,
     bell: bool,
+    notify: bool,
     trace: Option<PathBuf>,
 }
 
@@ -102,6 +106,7 @@ fn parse_args() -> Result<Args, String> {
         yolo: false,
         mouse: true,
         bell: true,
+        notify: false,
         trace: None,
     };
     let mut it = std::env::args().skip(1);
@@ -140,6 +145,7 @@ fn parse_args() -> Result<Args, String> {
             "--temp" => a.cfg.temperature = Some(num(&flag, val()?)?),
             "--no-mouse" => a.mouse = false,
             "--no-bell" => a.bell = false,
+            "--notify" => a.notify = true,
             "--trace" => a.trace = Some(PathBuf::from(val()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -194,6 +200,7 @@ fn main() {
         accept_all: args.yolo,
         mouse: args.mouse,
         bell: args.bell,
+        desktop: args.notify,
         theme: ui::themes::Theme::default(),
         procs: procs.clone(),
     };
