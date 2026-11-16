@@ -7,7 +7,7 @@ mod text;
 pub mod themes;
 
 use std::collections::{HashMap, VecDeque};
-use std::io::stdout;
+use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
@@ -34,7 +35,7 @@ use crate::tools::{DiffLine, Kind, Tool, clip};
 use input::Input;
 use text::{markdown, width, wrap, wrap_plain};
 
-const COMMANDS: [(&str, &str); 13] = [
+const COMMANDS: [(&str, &str); 14] = [
     ("/help", "keys and commands"),
     ("/clear", "start a new conversation"),
     (
@@ -61,6 +62,10 @@ const COMMANDS: [(&str, &str); 13] = [
         "the shell commands running, to kill one (also ctrl+p)",
     ),
     (
+        "/bell",
+        "ring the terminal's bell when an approval waits or a long answer ends, while you're elsewhere: on or off",
+    ),
+    (
         "/debug",
         "trace prompts, tokens and tool calls to a file: /debug <file>, /debug off",
     ),
@@ -83,6 +88,8 @@ const DIFF_LINES: usize = 40;
 const MAX_TOOL_OUTPUT: usize = 256 * 1024;
 /// Shell commands shown at once in their list
 const PS_ROWS: usize = 8;
+/// A turn at least this long rings the bell when it ends
+const BELL_AFTER: Duration = Duration::from_secs(10);
 
 /// A shortcut for building a themed style.
 macro_rules! themed {
@@ -194,6 +201,8 @@ pub struct Options {
     pub theme: Theme,
     /// the shell commands running
     pub procs: Procs,
+    /// ring the bell when the user is needed
+    pub bell: bool,
 }
 
 struct App {
@@ -251,6 +260,13 @@ struct App {
     /// copies to the clipboard: how it did
     clipboard: fn(&str) -> Result<&'static str, String>,
 
+    /// ring the bell when an approval waits or a long turn ends
+    bell: bool,
+    /// whether the terminal has the focus, if it reports it
+    focused: Option<bool>,
+    /// the bell is to ring, after this round of messages
+    ring: bool,
+
     /// lines from the bottom of the transcript, 0 to follow it
     scroll: usize,
     last_total: usize,
@@ -275,6 +291,7 @@ pub fn run(
             stdout(),
             DisableMouseCapture,
             DisableBracketedPaste,
+            DisableFocusChange,
             PopKeyboardEnhancementFlags
         );
         hook(info);
@@ -284,7 +301,8 @@ pub fn run(
         ratatui::crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
     );
-    let _ = execute!(stdout(), EnableBracketedPaste);
+    // the bell rings only while the user is elsewhere
+    let _ = execute!(stdout(), EnableBracketedPaste, EnableFocusChange);
     if opts.mouse {
         let _ = execute!(stdout(), EnableMouseCapture);
     }
@@ -299,7 +317,12 @@ pub fn run(
     if keyboard {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        DisableFocusChange
+    );
     ratatui::restore();
     result
 }
@@ -344,6 +367,9 @@ impl App {
             click: None,
             copied: String::new(),
             clipboard: clipboard::copy,
+            bell: opts.bell,
+            focused: None,
+            ring: false,
             scroll: 0,
             last_total: 0,
             page: 20,
@@ -397,7 +423,8 @@ impl App {
                             self.sel = None;
                             dirty = true;
                         }
-                        _ => {}
+                        TermEvent::FocusGained => self.focused = Some(true),
+                        TermEvent::FocusLost => self.focused = Some(false),
                     }
                     if !event::poll(Duration::ZERO)? {
                         break;
@@ -407,6 +434,10 @@ impl App {
             while let Ok(m) = msgs.try_recv() {
                 self.message(m);
                 dirty = true;
+            }
+            if std::mem::take(&mut self.ring) {
+                let mut out = stdout();
+                let _ = out.write_all(b"\x07").and_then(|_| out.flush());
             }
             if let Some((_, t)) = &self.notice
                 && t.elapsed() > Duration::from_secs(3)
@@ -451,6 +482,15 @@ impl App {
 
     fn touch_all(&mut self) {
         self.cache.iter_mut().for_each(|c| *c = None);
+    }
+
+    /// The user is needed: ring the bell, unless they are looking (the
+    /// terminal has the focus) or don't want it. A terminal that doesn't
+    /// report its focus is taken as unattended.
+    fn alert(&mut self) {
+        if self.bell && self.focused != Some(true) {
+            self.ring = true;
+        }
     }
 
     fn notify(&mut self, s: impl Into<String>) {
@@ -585,6 +625,7 @@ impl App {
                         self.phase = Phase::Asking;
                         // the change to approve must be in view
                         self.scroll = 0;
+                        self.alert();
                     }
                 }
                 self.touch(i);
@@ -620,9 +661,13 @@ impl App {
             }
             Msg::Idle => {
                 self.phase = Phase::Idle;
+                // a long turn ended, not interrupted, with nothing more to do
+                let long = self.busy_since.is_some_and(|t| t.elapsed() >= BELL_AFTER);
                 self.busy_since = None;
                 if let Some(next) = self.queue.pop_front() {
                     self.submit(next);
+                } else if long && !self.stop.load(Ordering::SeqCst) {
+                    self.alert();
                 }
             }
             Msg::Info(s) => {
@@ -634,6 +679,7 @@ impl App {
             Msg::Fatal(s) => {
                 self.phase = Phase::Dead;
                 self.status = "the model could not be loaded".into();
+                self.alert();
                 self.touch(0);
                 self.push(Entry::Error(s));
             }
@@ -732,6 +778,7 @@ impl App {
                 self.phase = Phase::Asking;
                 self.scroll = 0;
                 self.touch(i);
+                self.alert();
                 return;
             }
             self.touch(i);
@@ -1080,6 +1127,18 @@ impl App {
                 }
             }
             "/ps" | "/jobs" => self.ps = Some(0),
+            "/bell" => {
+                match line[name.len()..].trim() {
+                    "" => self.bell = !self.bell,
+                    "on" => self.bell = true,
+                    "off" => self.bell = false,
+                    a => {
+                        self.notify(format!("/bell on or off, not '{a}'"));
+                        return;
+                    }
+                }
+                self.notify(if self.bell { "bell on" } else { "bell off" });
+            }
             "/debug" => self.debug(line[name.len()..].trim()),
             _ => self.notify(format!("unknown command {name}, /help lists them")),
         }
@@ -2298,6 +2357,7 @@ mod tests {
             thinking: true,
             accept_all: false,
             mouse: false,
+            bell: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2382,6 +2442,7 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
+            bell: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2441,6 +2502,7 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
+            bell: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
@@ -2490,6 +2552,7 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
+            bell: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
@@ -2589,6 +2652,7 @@ mod tests {
             thinking: false,
             accept_all: false,
             mouse: false,
+            bell: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
@@ -2616,6 +2680,7 @@ mod tests {
             thinking: true,
             accept_all: false,
             mouse: false,
+            bell: false,
             theme: Theme::default(),
             procs: procs.clone(),
         };
@@ -2669,6 +2734,7 @@ mod tests {
             thinking: true,
             accept_all: false,
             mouse: true,
+            bell: false,
             theme: Theme::default(),
             procs: Procs::default(),
         };
@@ -2755,5 +2821,74 @@ mod tests {
         // a wide character takes two columns
         assert_eq!(columns("a漢b", 1, 3), "漢");
         assert_eq!(columns("a漢b", 3, 4), "b");
+    }
+
+    #[test]
+    fn bell_when_needed() {
+        let (cmd, _cmds) = channel();
+        let (own, _) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let opts = Options {
+            cwd: "/work/proj".into(),
+            thinking: false,
+            accept_all: false,
+            mouse: false,
+            bell: true,
+            theme: Theme::default(),
+            procs: Procs::default(),
+        };
+        let mut app = App::new(opts, cmd, own, stop.clone());
+        app.message(Msg::Idle);
+        let ask = |app: &mut App, id: usize| {
+            app.message(Msg::ToolStart {
+                id,
+                tool: Some(Tool::Bash),
+                title: "cargo test".into(),
+                diff: None,
+            });
+            let (reply, answer) = channel();
+            app.message(Msg::Permission { id, reply });
+            app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            assert!(matches!(answer.try_recv(), Ok(Decision::Allow)));
+        };
+        let turn = |app: &mut App, secs: u64| {
+            app.phase = Phase::Prompt;
+            app.busy_since = Some(Instant::now() - Duration::from_secs(secs));
+            app.message(Msg::Idle);
+        };
+
+        // the focus unknown: an approval, a long turn ring; a short one doesn't
+        ask(&mut app, 0);
+        assert!(std::mem::take(&mut app.ring));
+        turn(&mut app, 30);
+        assert!(std::mem::take(&mut app.ring));
+        turn(&mut app, 2);
+        assert!(!app.ring);
+        // nor one interrupted
+        stop.store(true, Ordering::SeqCst);
+        turn(&mut app, 30);
+        assert!(!app.ring);
+        stop.store(false, Ordering::SeqCst);
+
+        // the user looking: no bell
+        app.focused = Some(true);
+        ask(&mut app, 1);
+        turn(&mut app, 30);
+        assert!(!app.ring);
+        // elsewhere: the bell
+        app.focused = Some(false);
+        ask(&mut app, 2);
+        assert!(std::mem::take(&mut app.ring));
+
+        // turned off
+        typed(&mut app, "/bell");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.bell);
+        ask(&mut app, 3);
+        turn(&mut app, 30);
+        assert!(!app.ring);
+        typed(&mut app, "/bell on");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.bell);
     }
 }

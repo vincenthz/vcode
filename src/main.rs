@@ -61,6 +61,9 @@ usage: vcode [options] [directory]
       --temp <f>           sampling temperature [default: the model's]
       --no-mouse           leave the mouse to the terminal, rather than scroll
                            and select in vcode
+      --no-bell            don't ring the terminal's bell when an approval waits
+                           or a long answer ends while you're elsewhere (also
+                           /bell off)
       --trace <file>       trace the prompts, tokens and tool calls of the
                            agents to a file (also /debug <file>, /debug off)
   -h, --help
@@ -73,6 +76,7 @@ struct Args {
     prompt: Option<String>,
     yolo: bool,
     mouse: bool,
+    bell: bool,
     trace: Option<PathBuf>,
 }
 
@@ -97,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
         prompt: None,
         yolo: false,
         mouse: true,
+        bell: true,
         trace: None,
     };
     let mut it = std::env::args().skip(1);
@@ -134,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
             "-l" | "--lookup" => a.cfg.lookup = num(&flag, val()?)?,
             "--temp" => a.cfg.temperature = Some(num(&flag, val()?)?),
             "--no-mouse" => a.mouse = false,
+            "--no-bell" => a.bell = false,
             "--trace" => a.trace = Some(PathBuf::from(val()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -187,6 +193,7 @@ fn main() {
         thinking: args.cfg.thinking,
         accept_all: args.yolo,
         mouse: args.mouse,
+        bell: args.bell,
         theme: ui::themes::Theme::default(),
         procs: procs.clone(),
     };

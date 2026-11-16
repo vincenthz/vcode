@@ -139,10 +139,15 @@ conversation is compacted.
   whose shell exits but leaves processes running (`npm run dev &`) returns to
   the model and stays listed, in the background, until they end or are
   killed; the status line counts them. Quitting vcode kills them all
+- the terminal's bell rings when a call waits for your approval, or an answer
+  that took 10 s or more is done, while the terminal doesn't have the focus
+  (or doesn't say whether it has it); most terminals then flag the tab or
+  bounce the dock icon, tmux marks the window. `/bell off` or `--no-bell`
+  silence it
 
 Commands: `/clear`, `/ps`, `/compact` (replace the conversation with the model's
 summary of it, which also happens by itself at 80% of the context), `/pilot`,
-`/think`, `/nothink`, `/mode`, `/context`, `/help`, `/quit`.
+`/think`, `/nothink`, `/mode`, `/context`, `/bell`, `/help`, `/quit`.
 
 The context is 256k tokens by default (`-c`), at most the model's; a session
 allocates its whole KV cache up front, about 6.5 GB with the 35B-A3B at 256k.
