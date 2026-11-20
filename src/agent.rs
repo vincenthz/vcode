@@ -186,8 +186,33 @@ const MAX_STEPS: usize = 60;
 const MAX_PILOT_STEPS: usize = 100;
 /// Characters of a subagent's report given to the main agent at most
 const MAX_REPORT: usize = 20_000;
-/// Context used past which the conversation is compacted before a message
+/// Context used past which the conversation is compacted before a message,
+/// and the model told to wrap up during a turn
 const COMPACT_AT: f64 = 0.8;
+/// Tokens of the context kept, past the room for a final answer, for the
+/// summary of a compaction after it (its prompt and 2048 tokens)
+const COMPACT_ROOM: usize = 2560;
+/// Tokens of the template around a tool result
+const RESULT_OVERHEAD: usize = 8;
+/// Characters of a result clipped to fit the context, below which it is
+/// left out instead
+const MIN_CLIPPED: usize = 400;
+
+/// Added to tool results when the context runs low
+const LOW_NOTE: &str = "(Note from the system: your context is {pct}% full. Finish soon: make only the \
+calls you really need, then write your final answer. If you can't finish, say so at the start of your \
+answer, then give what is done, what is left to do, and what you found that is needed to go on.)";
+
+/// Added to tool results when the context is out of room but for the final answer
+const OUT_NOTE: &str = "(Note from the system: your context is full. Don't call any more tools: they \
+won't run. Write your final answer now, without calling tools. Start it by saying that you did not \
+finish because your context ran out, then give what is done, what is left to do, and everything you \
+found that is needed to go on.)";
+
+/// The result of a call left out, or not run, for lack of context
+const NO_ROOM: &str = "Not shown: no room left in the context.";
+const NOT_RUN_FULL: &str = "Not run: your context is full. Write your final answer now, without \
+calling tools.";
 
 const COMPACT_PROMPT: &str = "Stop working on the task for now. Write a summary of our conversation so far, \
 to continue from it after the conversation is cleared. Include: what I asked for, the decisions made, the \
@@ -434,7 +459,7 @@ fn session<'m>(
         match cmd {
             Cmd::Send(text) => {
                 agent.worker.stop.store(false, Ordering::SeqCst);
-                if agent.used() > COMPACT_AT {
+                if agent.room() > Room::Plenty {
                     agent
                         .worker
                         .info("context almost full, compacting the conversation".into());
@@ -575,6 +600,74 @@ enum End {
     Failed(String),
     /// after too many calls, with the text of the last turn
     TooManySteps(String),
+    /// with this answer, without tool calls, but the work may not be done:
+    /// the context ran low or out first, or the answer was cut short
+    Unfinished(String, Cut),
+}
+
+/// Why an answer may not be the end of the work
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// the model was told its context was running low, and wrapped up
+    Low,
+    /// the context ran out: the model was told to stop and answer, or it
+    /// couldn't go on at all
+    Out,
+    /// the answer stopped at the length limit, or at the end of the context
+    Truncated,
+}
+
+/// How much of a conversation's context is left
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Room {
+    Plenty,
+    /// time to wrap up
+    Low,
+    /// only enough for a final answer
+    Out,
+}
+
+/// Tokens of a chat's context kept for a final answer, and a compaction
+/// after it: an answer at its longest, unless that is more than an eighth
+/// of the context
+fn reserve(opts: &ChatOptions) -> usize {
+    opts.max_tokens.min(opts.context / 8) + COMPACT_ROOM
+}
+
+/// The room left in a context of `context` tokens, `n_past` of them used,
+/// once `incoming` more are given: out with less than the `reserve` left;
+/// low past [`COMPACT_AT`], or with less than an eighth of the context left
+/// past the reserve, a few calls' worth
+fn room(n_past: usize, incoming: usize, context: usize, reserve: usize) -> Room {
+    let after = n_past + incoming;
+    let left = context.saturating_sub(after);
+    if left < reserve {
+        Room::Out
+    } else if after as f64 > COMPACT_AT * context as f64 || left < reserve + context / 8 {
+        Room::Low
+    } else {
+        Room::Plenty
+    }
+}
+
+/// `results` cut to about `budget` tokens of `tokens` in all, each in
+/// proportion to its size, its middle left out; a long result that would
+/// keep too little is left out entirely
+fn squeeze(results: &mut [String], tokens: usize, budget: usize) {
+    if tokens <= budget {
+        return;
+    }
+    for r in results.iter_mut() {
+        let keep = r.len() * budget / tokens;
+        // a short result is kept whole: it takes next to nothing
+        if r.len() > keep.max(MIN_CLIPPED) {
+            *r = if keep < MIN_CLIPPED {
+                NO_ROOM.to_string()
+            } else {
+                tools::middle_out(r, keep)
+            };
+        }
+    }
 }
 
 impl<'m> Worker<'m> {
@@ -607,7 +700,7 @@ impl<'m> Worker<'m> {
         &mut self,
         chat: &mut Chat<'_>,
         input: Input,
-    ) -> Result<(TurnStats, String), String> {
+    ) -> Result<(TurnStats, String), biv::Error> {
         self.send(Msg::Generating);
         self.trace.prompt += 1;
         let tag = self.trace;
@@ -656,11 +749,7 @@ impl<'m> Worker<'m> {
         if self.task.is_none() {
             self.send(Msg::Context(chat.n_past()));
         }
-        let stats = result.map_err(|e| {
-            let e = e.to_string();
-            trace::event(tag, "turn failed", &e);
-            e
-        })?;
+        let stats = result.inspect_err(|e| trace::event(tag, "turn failed", &e.to_string()))?;
         let t1 = t1.unwrap_or(t0);
         let rate = |n: usize, s: f64| n as f64 / s.max(1e-6);
         let prompt_s = (t1 - t0).as_secs_f64();
@@ -696,20 +785,64 @@ impl<'m> Worker<'m> {
     }
 
     /// A message to the model of `chat`, then as many tool calls as it takes,
-    /// `max_steps` at most: how it ended, and the number of calls
+    /// `max_steps` at most: how it ended, and the number of calls. As the
+    /// context fills up the model is told to wrap up, then to stop and
+    /// answer; an answer given then says the work may not be done.
     fn converse(&mut self, chat: &mut Chat<'_>, text: String, max_steps: usize) -> (End, usize) {
         let mut input = Input::User(text);
         let mut steps = 0;
+        // the least room the model was told of
+        let mut told = Room::Plenty;
+        // calls refused for lack of room, once; results left out, once
+        let (mut refused, mut left_out) = (false, false);
+        // the text of the last turn
+        let mut last = String::new();
         loop {
+            let results = match &input {
+                Input::Tools(r) => Some(r.len()),
+                Input::User(_) => None,
+            };
             let (stats, answer) = match self.generate(chat, input) {
                 Ok(s) => s,
-                Err(e) => return (End::Failed(e), steps),
+                // the results didn't fit after all: the model is told so instead
+                Err(biv::Error::ContextFull { .. }) if results.is_some() && !left_out => {
+                    let n = results.unwrap_or(1).max(1);
+                    trace::event(self.trace, "context full: results left out", "");
+                    left_out = true;
+                    told = Room::Out;
+                    let mut r = vec![NO_ROOM.to_string(); n];
+                    r[n - 1] = format!("{NO_ROOM}\n\n{OUT_NOTE}");
+                    input = Input::Tools(r);
+                    continue;
+                }
+                // not even room to say so
+                Err(biv::Error::ContextFull { .. }) if results.is_some() => {
+                    return (End::Unfinished(last, Cut::Out), steps);
+                }
+                Err(e) => return (End::Failed(e.to_string()), steps),
             };
             if self.stopped() {
                 return (End::Stopped(None), steps);
             }
             if stats.tool_calls.is_empty() {
-                return (End::Answered(answer), steps);
+                let end = match (told, stats.truncated) {
+                    (Room::Out, _) => End::Unfinished(answer, Cut::Out),
+                    (_, true) => End::Unfinished(answer, Cut::Truncated),
+                    (Room::Low, false) => End::Unfinished(answer, Cut::Low),
+                    (Room::Plenty, false) => End::Answered(answer),
+                };
+                return (end, steps);
+            }
+            if told == Room::Out {
+                // told not to call tools: refused once, then stopped
+                if refused || left_out {
+                    return (End::Unfinished(answer, Cut::Out), steps);
+                }
+                refused = true;
+                trace::event(self.trace, "context full: calls refused", "");
+                input = Input::Tools(vec![NOT_RUN_FULL.to_string(); stats.tool_calls.len()]);
+                last = answer;
+                continue;
             }
             if steps >= max_steps {
                 return (End::TooManySteps(answer), steps);
@@ -719,8 +852,54 @@ impl<'m> Worker<'m> {
             if self.stopped() {
                 return (End::Stopped(Some(results)), steps);
             }
+            let (results, room) = self.fit(chat, results);
+            if room > told {
+                self.info(match room {
+                    Room::Out => "context full: told to stop and answer".into(),
+                    _ => "context almost full: told to wrap up".into(),
+                });
+                told = room;
+            }
             input = Input::Tools(results);
+            last = answer;
         }
+    }
+
+    /// The results of the last calls as given to the model of `chat`, and
+    /// the room left once they are: a note added when the context runs low;
+    /// when it runs out, the results cut to leave room for a final answer,
+    /// and the model told to give it
+    fn fit(&self, chat: &Chat<'_>, mut results: Vec<String>) -> (Vec<String>, Room) {
+        let (n_past, context) = (chat.n_past(), chat.opts.context);
+        let reserve = reserve(&chat.opts);
+        let tokens: usize = results
+            .iter()
+            .map(|r| self.tok.encode(r).len() + RESULT_OVERHEAD)
+            .sum();
+        let room = room(n_past, tokens, context, reserve);
+        let note = match room {
+            Room::Plenty => return (results, room),
+            Room::Low => {
+                let pct = ((n_past + tokens) * 100 / context.max(1)).min(99);
+                LOW_NOTE.replace("{pct}", &pct.to_string())
+            }
+            Room::Out => {
+                let note = self.tok.encode(OUT_NOTE).len() + RESULT_OVERHEAD;
+                let budget = context.saturating_sub(n_past + reserve + note);
+                squeeze(&mut results, tokens, budget);
+                OUT_NOTE.to_string()
+            }
+        };
+        trace::event(
+            self.trace,
+            &format!("context {room:?}: {n_past} + {tokens} of {context} tokens, {reserve} kept"),
+            "",
+        );
+        if let Some(r) = results.last_mut() {
+            r.push_str("\n\n");
+            r.push_str(&note);
+        }
+        (results, room)
     }
 
     /// The results of a turn's calls, in their order. Tasks called one after
@@ -1097,6 +1276,36 @@ impl<'m> Worker<'m> {
                     tools::clip(a.trim(), MAX_REPORT)
                 ),
             ),
+            End::Unfinished(a, cut) => {
+                let (ok, what, why) = match cut {
+                    // it may have finished: its report says
+                    Cut::Low => (
+                        true,
+                        "context low",
+                        "The subagent's context ran low and it was told to wrap up: it may not have \
+                         finished everything, check its report for what is left.",
+                    ),
+                    Cut::Out => (
+                        false,
+                        "context full",
+                        "The subagent ran out of context and was stopped before finishing: the task \
+                         is NOT complete.",
+                    ),
+                    Cut::Truncated => (
+                        false,
+                        "report cut short",
+                        "The subagent's report was cut short at the length limit: the task may not \
+                         be complete.",
+                    ),
+                };
+                let a = a.trim();
+                let text = if a.is_empty() {
+                    format!("{why} It gave no report.")
+                } else {
+                    format!("{why} Its report:\n{}", tools::clip(a, MAX_REPORT))
+                };
+                (ok, format!("{what} · {took}"), text)
+            }
         };
         trace::event(
             self.trace,
@@ -1279,9 +1488,10 @@ impl Agent<'_> {
         self.worker.info(format!("subagents' context: {n} tokens"));
     }
 
-    /// The part of the context in use
-    fn used(&self) -> f64 {
-        self.chat.n_past() as f64 / self.chat.opts.context as f64
+    /// The room left in the conversation's context: when low, the model
+    /// would be told to wrap up as soon as it calls tools
+    fn room(&self) -> Room {
+        room(self.chat.n_past(), 0, self.chat.opts.context, reserve(&self.chat.opts))
     }
 
     fn clear(&mut self) {
@@ -1366,6 +1576,12 @@ impl Agent<'_> {
             End::TooManySteps(_) => self.worker.info(format!(
                 "stopped after {steps} tool calls; send a message to continue"
             )),
+            // the stats already say the answer was truncated
+            End::Unfinished(_, Cut::Truncated) => {}
+            End::Unfinished(_, Cut::Low | Cut::Out) => self.worker.info(
+                "the context is almost full: the conversation is compacted before your next message"
+                    .into(),
+            ),
         }
     }
 
@@ -1483,5 +1699,62 @@ mod tests {
         for bad in ["", "k", "12kb", "-1", "1.5k", "99999999999999999999m"] {
             assert_eq!(parse_tokens(bad), None, "{bad}");
         }
+    }
+
+    fn opts(context: usize, max_tokens: usize) -> ChatOptions {
+        ChatOptions {
+            context,
+            max_tokens,
+            ..ChatOptions::default()
+        }
+    }
+
+    #[test]
+    fn room_for_an_answer() {
+        // the defaults: 16k answers, in a subagent's 128k and the main 256k
+        assert_eq!(reserve(&opts(128 << 10, 16384)), 16384 + COMPACT_ROOM);
+        assert_eq!(reserve(&opts(256 << 10, 16384)), 16384 + COMPACT_ROOM);
+        // a small context keeps an eighth of it for the answer
+        assert_eq!(reserve(&opts(16 << 10, 16384)), 2048 + COMPACT_ROOM);
+    }
+
+    #[test]
+    fn room_levels() {
+        let ctx = 128 << 10;
+        let r = reserve(&opts(ctx, 16384));
+        assert_eq!(room(10_000, 6_000, ctx, r), Room::Plenty);
+        // low a few calls before the end: about 73% of a subagent's context
+        assert_eq!(room(90_000, 6_000, ctx, r), Room::Low);
+        assert_eq!(room(ctx - r - 1, 0, ctx, r), Room::Low);
+        // out with less than the reserve left, or past the end
+        assert_eq!(room(ctx - r, 1, ctx, r), Room::Out);
+        assert_eq!(room(120_000, 40_000, ctx, r), Room::Out);
+        // a large context is low past COMPACT_AT
+        let ctx = 256 << 10;
+        let r = reserve(&opts(ctx, 16384));
+        assert_eq!(room(200_000, 0, ctx, r), Room::Plenty);
+        assert_eq!(room(200_000, 10_000, ctx, r), Room::Low);
+        // a small one isn't low as soon as it starts
+        let ctx = 32 << 10;
+        let r = reserve(&opts(ctx, 16384));
+        assert_eq!(room(8_000, 6_000, ctx, r), Room::Plenty);
+    }
+
+    #[test]
+    fn squeezed_results() {
+        let big = "line\n".repeat(2000);
+        let mut results = vec![big.clone(), "ok".to_string(), big.clone()];
+        // all fits: unchanged
+        squeeze(&mut results, 1000, 1000);
+        assert_eq!(results[0], big);
+        // cut in proportion, the middle left out; the short one kept
+        squeeze(&mut results, 1000, 250);
+        assert!(results[0].len() < big.len() / 2, "{}", results[0].len());
+        assert!(results[0].contains("lines omitted"));
+        assert_eq!(results[1], "ok");
+        // too little left: the long ones left out
+        let mut results = vec![big.clone(), "ok".to_string()];
+        squeeze(&mut results, 1000, 10);
+        assert_eq!(results, [NO_ROOM, "ok"]);
     }
 }

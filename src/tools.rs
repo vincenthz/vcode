@@ -1048,7 +1048,7 @@ pub fn clip(s: &str, n: usize) -> String {
 }
 
 /// `s` cut to about `max` bytes by leaving out its middle
-fn middle_out(s: &str, max: usize) -> String {
+pub fn middle_out(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
