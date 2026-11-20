@@ -24,7 +24,7 @@
 //! it directs subagents and keeps the view of the project and of the plan.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -64,6 +64,8 @@ pub struct Config {
     pub parallel: usize,
     /// the shell commands running, which the interface lists and can kill
     pub procs: crate::procs::Procs,
+    /// where the tools run, when not here
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
 }
 
 /// From the interface to the agent
@@ -156,6 +158,14 @@ pub enum Msg {
         ok: bool,
         output: String,
     },
+    /// a `/sandbox` command is done (sent by the interface to itself): what
+    /// it says, and for `/sandbox diff` the files changed there, each with
+    /// its title, its summary, and its diff (None for a binary file)
+    Sandbox {
+        text: String,
+        error: bool,
+        diffs: Vec<(String, String, Option<Vec<DiffLine>>)>,
+    },
     /// a message of the subagent doing the task of call `task`
     Sub {
         task: usize,
@@ -223,14 +233,14 @@ fn definitions(tools: impl IntoIterator<Item = Tool>) -> Vec<String> {
 /// pilot mode or not, with subagents or not, working at the same time or not
 fn main_options(
     base: &ChatOptions,
-    cwd: &Path,
+    env: &Env,
     pilot: bool,
     subagents: bool,
     parallel: bool,
 ) -> ChatOptions {
     let (system, tools): (String, Vec<Tool>) = if pilot {
         (
-            crate::prompt::pilot(cwd, parallel),
+            crate::prompt::pilot(env, parallel),
             vec![Tool::Task, Tool::UpdatePlan],
         )
     } else {
@@ -238,7 +248,7 @@ fn main_options(
             .into_iter()
             .filter(|&t| t != Tool::UpdatePlan && (subagents || t != Tool::Task))
             .collect();
-        (crate::prompt::system(cwd, subagents, parallel), tools)
+        (crate::prompt::system(env, subagents, parallel), tools)
     };
     ChatOptions {
         system: Some(system),
@@ -348,7 +358,17 @@ fn session<'m>(
         context: cfg.sub_context.min(setup.max_context),
         ..base.clone()
     });
-    let opts = main_options(&base, &cfg.cwd, cfg.pilot, subagents, parallel);
+    let env = Env {
+        cwd: cfg
+            .sandbox
+            .as_ref()
+            .map_or_else(|| cfg.cwd.clone(), |s| s.root.clone()),
+        stop: stop.clone(),
+        procs: cfg.procs.clone(),
+        owner: "agent".into(),
+        sandbox: cfg.sandbox.clone(),
+    };
+    let opts = main_options(&base, &env, cfg.pilot, subagents, parallel);
     let context = opts.context;
     let sub_context = sub_base.as_ref().map_or(0, |o| o.context);
     let mut chat = Chat::new(engine, tok, opts).map_err(|e| e.to_string())?;
@@ -397,12 +417,7 @@ fn session<'m>(
             sampler: Sampler::new(setup.sampling.clone()),
             sampling: setup.sampling,
             tx: tx.clone(),
-            env: Env {
-                cwd: cfg.cwd.clone(),
-                stop: stop.clone(),
-                procs: cfg.procs.clone(),
-                owner: "agent".into(),
-            },
+            env,
             stop,
             ids: Arc::new(AtomicUsize::new(0)),
             sub_base,
@@ -949,7 +964,7 @@ impl<'m> Worker<'m> {
     fn task_options(&self, role: Role) -> Result<ChatOptions, String> {
         let base = self.sub_base.clone().ok_or("no subagents")?;
         Ok(ChatOptions {
-            system: Some(crate::prompt::subagent(&self.env.cwd, role)),
+            system: Some(crate::prompt::subagent(&self.env, role)),
             tools: definitions(role.tools()),
             ..base
         })
@@ -989,6 +1004,7 @@ impl<'m> Worker<'m> {
                 stop: self.stop.clone(),
                 procs: self.env.procs.clone(),
                 owner: format!("{} #{task}", role.name()),
+                sandbox: self.env.sandbox.clone(),
             },
             ids: self.ids.clone(),
             sampling: SamplerConfig {
@@ -1289,11 +1305,11 @@ impl Agent<'_> {
             ));
             return;
         }
-        let cwd = self.worker.env.cwd.clone();
         let parallel = self.worker.shared.is_some();
         self.carry.clear();
         if pilot != self.pilot {
-            self.chat.opts = main_options(&self.base, &cwd, pilot, self.subagents, parallel);
+            self.chat.opts =
+                main_options(&self.base, &self.worker.env, pilot, self.subagents, parallel);
             if self.prefixes[pilot as usize].is_none() {
                 self.worker.info("reading the system prompt".into());
                 match self.chat.reset().and_then(|()| self.chat.save()) {
@@ -1301,7 +1317,13 @@ impl Agent<'_> {
                     Err(e) => {
                         self.worker.send(Msg::Error(format!("switching mode: {e}")));
                         self.chat.opts =
-                            main_options(&self.base, &cwd, self.pilot, self.subagents, parallel);
+                            main_options(
+                                &self.base,
+                                &self.worker.env,
+                                self.pilot,
+                                self.subagents,
+                                parallel,
+                            );
                         self.clear();
                         return;
                     }

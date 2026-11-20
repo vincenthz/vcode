@@ -32,11 +32,12 @@ use themes::Theme;
 
 use crate::agent::{Cmd, Decision, Msg};
 use crate::procs::{Info, Procs};
+use crate::sandbox::Sandbox;
 use crate::tools::{DiffLine, Kind, Tool, clip};
 use input::Input;
 use text::{markdown, width, wrap, wrap_plain};
 
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 16] = [
     ("/help", "keys and commands"),
     ("/clear", "start a new conversation"),
     (
@@ -74,6 +75,10 @@ const COMMANDS: [(&str, &str); 15] = [
         "/debug",
         "trace prompts, tokens and tool calls to a file: /debug <file>, /debug off",
     ),
+    (
+        "/sandbox",
+        "the files changed in the sandbox; /sandbox diff shows them, /sandbox pull brings them here, /sandbox push copies there what changed here",
+    ),
     ("/quit", "exit"),
     ("/exit", "exit"),
 ];
@@ -85,7 +90,8 @@ shift+tab permission mode · ctrl+t show reasoning · shift+ctrl+t cycle theme
 ctrl+o expand tool output · pgup/pgdn or the mouse wheel scroll
 drag to select and copy · double-click a word, triple-click a line
 ctrl+p the shell commands running: ↑↓ select, k kill, esc close
-!<command> runs a shell command; its output goes with your next message";
+!<command> runs a shell command (in the sandbox, if any; !!<command> here);
+its output goes with your next message";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const OUTPUT_LINES: usize = 5;
@@ -210,6 +216,8 @@ pub struct Options {
     pub bell: bool,
     /// and show a desktop notification
     pub desktop: bool,
+    /// where the tools run, when not here
+    pub sandbox: Option<Arc<Sandbox>>,
 }
 
 struct App {
@@ -225,6 +233,8 @@ struct App {
     own: Sender<Msg>,
     stop: Arc<AtomicBool>,
     cwd: PathBuf,
+    /// where the tools run, when not here
+    sandbox: Option<Arc<Sandbox>>,
     /// the shell commands running
     procs: Procs,
     /// the list of the shell commands is open, at the one selected (its id,
@@ -349,6 +359,7 @@ impl App {
             own,
             stop,
             cwd: opts.cwd,
+            sandbox: opts.sandbox,
             procs: opts.procs,
             ps: None,
             phase: Phase::Loading,
@@ -730,6 +741,24 @@ impl App {
                 self.touch(0);
                 self.push(Entry::Error(s));
             }
+            Msg::Sandbox { text, error, diffs } => {
+                self.push(if error {
+                    Entry::Error(text)
+                } else {
+                    Entry::Info(text)
+                });
+                for (title, summary, diff) in diffs {
+                    self.push(Entry::Tool(ToolRun {
+                        tool: Some(Tool::EditFile),
+                        title,
+                        diff,
+                        output: String::new(),
+                        state: ToolState::Done { ok: true, summary },
+                        parent: None,
+                        activity: String::new(),
+                    }));
+                }
+            }
             Msg::Shell { entry, ok, output } => {
                 if let Some(Entry::Shell { cmd, output: out }) = self.entries.get_mut(entry) {
                     let context = format!(
@@ -1025,8 +1054,12 @@ impl App {
 
     fn submit(&mut self, text: String) {
         let trimmed = text.trim();
+        if let Some(cmd) = trimmed.strip_prefix("!!") {
+            self.shell(cmd.trim().to_string(), true);
+            return;
+        }
         if let Some(cmd) = trimmed.strip_prefix('!') {
-            self.shell(cmd.trim().to_string());
+            self.shell(cmd.trim().to_string(), false);
             return;
         }
         if trimmed.starts_with('/') {
@@ -1203,8 +1236,114 @@ impl App {
                 });
             }
             "/debug" => self.debug(line[name.len()..].trim()),
+            "/sandbox" => self.sandbox_command(line[name.len()..].trim()),
             _ => self.notify(format!("unknown command {name}, /help lists them")),
         }
+    }
+
+    /// `/sandbox`: what changed in the sandbox; `/sandbox diff` shows it,
+    /// `/sandbox pull` brings it here, `/sandbox push` copies there what
+    /// changed here. Run on a thread of its own, its result sent back.
+    fn sandbox_command(&mut self, arg: &str) {
+        let Some(sb) = self.sandbox.clone() else {
+            self.notify("no sandbox: start vcode with --sandbox ssh:HOST or --sandbox vemu:NAME");
+            return;
+        };
+        if !matches!(arg, "" | "status" | "diff" | "pull" | "push") {
+            self.notify(format!(
+                "/sandbox, /sandbox diff, /sandbox pull or /sandbox push, not '{arg}'"
+            ));
+            return;
+        }
+        // not while the agent changes files there
+        if matches!(arg, "pull" | "push") && !matches!(self.phase, Phase::Idle | Phase::Dead) {
+            self.notify("wait until the agent is done, or interrupt it (esc)");
+            return;
+        }
+        self.notify(match arg {
+            "pull" => format!("pulling from {}…", sb.label),
+            "push" => format!("copying to {}…", sb.label),
+            _ => format!("looking at {}…", sb.label),
+        });
+        let own = self.own.clone();
+        let arg = arg.to_string();
+        std::thread::spawn(move || {
+            let label = &sb.label;
+            let result = match arg.as_str() {
+                "pull" => sb.pull().map(|r| (r.describe("pulled", "from", label), Vec::new())),
+                "push" => sb
+                    .push(&mut |_| {})
+                    .map(|r| (r.describe("copied", "to", label), Vec::new())),
+                "diff" => sb.diff().map(|d| {
+                    let text = match d.len() {
+                        0 => format!("no files changed in {label}"),
+                        n => format!(
+                            "{n} file{} changed in {label}, from the files here to those there \
+                             (/sandbox pull brings them here):",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    };
+                    let diffs = d
+                        .into_iter()
+                        .map(|f| {
+                            let c = &f.change;
+                            let summary = match &f.lines {
+                                None => "binary".to_string(),
+                                Some(l) => {
+                                    let (a, r) = crate::tools::count_changes(l);
+                                    format!("+{a} -{r}")
+                                }
+                            };
+                            let summary = if c.conflict {
+                                format!("{summary} · changed here too: not pulled")
+                            } else {
+                                summary
+                            };
+                            (format!("{} {}", c.kind.verb(), c.path), summary, f.lines)
+                        })
+                        .collect();
+                    (text, diffs)
+                }),
+                _ => sb.changes().map(|c| {
+                    let mut s = format!(
+                        "sandbox {label}: {} ({})",
+                        sb.root.display(),
+                        sb.platform
+                    );
+                    if c.is_empty() {
+                        s.push_str("\nno files changed there since the last copy");
+                    } else {
+                        s.push_str(&format!(
+                            "\n{} file{} changed there (/sandbox diff shows them, /sandbox pull brings them here):",
+                            c.len(),
+                            if c.len() == 1 { "" } else { "s" }
+                        ));
+                        for ch in &c {
+                            s.push_str(&format!(
+                                "\n  {:<8} {}{}",
+                                ch.kind.verb(),
+                                ch.path,
+                                if ch.conflict { "  (changed here too)" } else { "" }
+                            ));
+                        }
+                    }
+                    (s, Vec::new())
+                }),
+            };
+            let msg = match result {
+                Ok((text, diffs)) => Msg::Sandbox {
+                    text,
+                    error: false,
+                    diffs,
+                },
+                Err(e) => Msg::Sandbox {
+                    text: format!("sandbox {label}: {e}"),
+                    error: true,
+                    diffs: Vec::new(),
+                },
+            };
+            let _ = own.send(msg);
+        });
     }
 
     /// `/debug`: the trace's state; `/debug <file>` traces to the file,
@@ -1234,8 +1373,9 @@ impl App {
         self.push(Entry::Info(msg));
     }
 
-    /// A `!` command: run here, its output kept for the next message
-    fn shell(&mut self, cmd: String) {
+    /// A `!` command: run in the sandbox, if any, unless `here`; its output
+    /// kept for the next message
+    fn shell(&mut self, cmd: String, here: bool) {
         if cmd.is_empty() {
             return;
         }
@@ -1246,8 +1386,9 @@ impl App {
         let own = self.own.clone();
         let cwd = self.cwd.clone();
         let procs = self.procs.clone();
+        let sandbox = if here { None } else { self.sandbox.clone() };
         std::thread::spawn(move || {
-            let out = crate::tools::shell(&cwd, &cmd, &procs);
+            let out = crate::tools::shell(&cwd, &cmd, &procs, sandbox);
             let _ = own.send(Msg::Shell {
                 entry,
                 ok: out.ok,
@@ -1424,13 +1565,16 @@ impl App {
         );
         let model = Span::styled(
             format!(
-                "{}{} · ",
+                "{}{}{} · ",
                 if self.model.is_empty() {
                     "loading"
                 } else {
                     &self.model
                 },
-                if self.thinking { " · reasoning" } else { "" }
+                if self.thinking { " · reasoning" } else { "" },
+                self.sandbox
+                    .as_ref()
+                    .map_or(String::new(), |s| format!(" · in {}", s.label))
             ),
             DIM,
         );
@@ -1949,6 +2093,17 @@ impl App {
                 };
                 out.extend(wrap_plain(&model, DIM, w, &[], &[Span::raw("     ")]));
                 out.push(Line::styled(format!("   {}", self.cwd.display()), DIM));
+                if let Some(sb) = &self.sandbox {
+                    out.push(Line::styled(
+                        format!(
+                            "   sandbox {}: {} ({}) · /sandbox diff, /sandbox pull",
+                            sb.label,
+                            sb.root.display(),
+                            sb.platform
+                        ),
+                        themed!(self, AccentMild),
+                    ));
+                }
                 if self.pilot {
                     out.push(Line::styled(
                         "   pilot mode: the agent plans and directs subagents (/pilot to leave)",
@@ -2412,6 +2567,44 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_results() {
+        let (cmd, _cmds) = channel();
+        let (own, _) = channel();
+        let opts = Options {
+            cwd: "/work/proj".into(),
+            thinking: true,
+            accept_all: false,
+            mouse: false,
+            bell: false,
+            desktop: false,
+            theme: Theme::default(),
+            procs: Procs::default(),
+            sandbox: None,
+        };
+        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
+        app.message(Msg::Idle);
+        // without one, said so
+        typed(&mut app, "/sandbox diff");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.notice.as_ref().is_some_and(|(n, _)| n.contains("no sandbox")));
+        // a diff's result: the files as edits are shown
+        app.message(Msg::Sandbox {
+            text: "1 file changed in vemu:dev".into(),
+            error: false,
+            diffs: vec![(
+                "Changed src/a.rs".into(),
+                "+1 -1".into(),
+                Some(crate::tools::diff("a\nb\n", "a\nc\n")),
+            )],
+        });
+        let s = screen(&mut app, 80, 30);
+        assert!(s.contains("1 file changed in vemu:dev"), "{s}");
+        assert!(s.contains("Changed src/a.rs"), "{s}");
+        assert!(s.contains("- b") || s.contains("-b"), "{s}");
+        assert!(s.contains("+ c") || s.contains("+c"), "{s}");
+    }
+
+    #[test]
     fn a_session() {
         let (cmd, cmds) = channel();
         let (own, _) = channel();
@@ -2424,6 +2617,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Ready {
@@ -2510,6 +2704,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
@@ -2571,6 +2766,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
         let mut run = |app: &mut App, line: &str| {
@@ -2622,6 +2818,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
         let sub = |task: usize, m: Msg| Msg::Sub {
@@ -2723,6 +2920,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };        let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Pilot(true));
         app.message(Msg::Idle);
@@ -2752,6 +2950,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: procs.clone(),
+            sandbox: None,
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         app.message(Msg::Idle);
@@ -2807,6 +3006,7 @@ mod tests {
             desktop: false,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };
         let mut app = App::new(opts, cmd, own, Arc::new(AtomicBool::new(false)));
         // not the system's, in a test
@@ -2907,6 +3107,7 @@ mod tests {
             desktop: true,
             theme: Theme::default(),
             procs: Procs::default(),
+            sandbox: None,
         };
         let mut app = App::new(opts, cmd, own, stop.clone());
         app.message(Msg::Idle);

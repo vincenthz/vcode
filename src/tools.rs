@@ -16,6 +16,7 @@ use biv::chat::ToolCall;
 
 use crate::procs::Procs;
 use crate::roles::Role;
+use crate::sandbox::{Mark, Sandbox};
 use similar::{ChangeTag, TextDiff};
 
 /// The functions the model can call
@@ -122,6 +123,10 @@ const MAX_RESULTS: usize = 200;
 /// How long the output of a command whose shell exited may still come,
 /// before what holds it open is taken for processes left in the background
 const BACKGROUND_AFTER: Duration = Duration::from_millis(300);
+/// Files larger than this aren't searched in a sandbox (they would be copied)
+const MAX_GREP_FILE: u64 = 4 << 20;
+/// Files a glob finds in a sandbox past which they aren't sorted by time
+const MAX_SORTED: usize = 5000;
 
 /// What approving a call allows
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -204,6 +209,8 @@ pub struct Env {
     pub procs: Procs,
     /// who runs them, as listed: `agent`, `explore #12`, `you`
     pub owner: String,
+    /// where the tools run when not here: `cwd` is then its work directory
+    pub sandbox: Option<Arc<Sandbox>>,
 }
 
 fn arg<'a>(call: &'a ToolCall, name: &str) -> Option<&'a str> {
@@ -239,12 +246,32 @@ impl Env {
         if path.is_empty() || path == "." {
             return self.cwd.clone();
         }
-        if let Some(rest) = path.strip_prefix("~/")
-            && let Some(home) = std::env::var_os("HOME")
-        {
-            return PathBuf::from(home).join(rest);
+        if let Some(rest) = path.strip_prefix("~/") {
+            if let Some(s) = &self.sandbox {
+                return s.home.join(rest);
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(rest);
+            }
         }
         self.cwd.join(path)
+    }
+
+    /// The content of a file, here or in the sandbox
+    fn load(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        match &self.sandbox {
+            Some(s) => s.read(path),
+            None => std::fs::read(path),
+        }
+    }
+
+    fn load_text(&self, path: &Path) -> std::io::Result<String> {
+        String::from_utf8(self.load(path)?).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })
     }
 
     /// A path as shown: relative to the working directory when inside it
@@ -284,7 +311,7 @@ impl Env {
             Tool::WriteFile => {
                 let path = self.resolve(required(call, "path")?);
                 let content = required(call, "content")?.to_string();
-                let old = std::fs::read_to_string(&path).ok();
+                let old = self.load_text(&path).ok();
                 let created = old.is_none();
                 let diff = diff(old.as_deref().unwrap_or(""), &content);
                 Plan {
@@ -307,7 +334,8 @@ impl Env {
                 let old_string = required(call, "old_string")?;
                 let new_string = required(call, "new_string")?;
                 let all = boolean(call, "replace_all");
-                let old = std::fs::read_to_string(&path)
+                let old = self
+                    .load_text(&path)
                     .map_err(|e| format!("{}: {e}", self.show(&path)))?;
                 if old_string.is_empty() {
                     return Err("old_string is empty: use write_file to create a file".into());
@@ -387,10 +415,15 @@ impl Env {
                 content,
                 created,
             } => (|| {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                match &self.sandbox {
+                    Some(s) => s.write(&path, content.as_bytes())?,
+                    None => {
+                        if let Some(dir) = path.parent() {
+                            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                        }
+                        std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+                    }
                 }
-                std::fs::write(&path, &content).map_err(|e| e.to_string())?;
                 let (added, removed) = plan.diff.as_deref().map(count_changes).unwrap_or((0, 0));
                 let summary = if created {
                     format!("{} lines", content.lines().count())
@@ -417,10 +450,15 @@ impl Env {
 
     fn read(&self, path: &Path, offset: usize, limit: usize) -> Result<Output, String> {
         let shown = self.show(path);
-        if path.is_dir() {
-            return Err(format!("{shown} is a directory, use list_dir"));
+        let is_dir = || format!("{shown} is a directory, use list_dir");
+        if self.sandbox.is_none() && path.is_dir() {
+            return Err(is_dir());
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
+        let bytes = match self.load(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => return Err(is_dir()),
+            Err(e) => return Err(format!("{shown}: {e}")),
+        };
         if bytes.iter().take(8192).any(|&b| b == 0) {
             return Err(format!("{shown}: binary file, {} bytes", bytes.len()));
         }
@@ -466,22 +504,28 @@ impl Env {
     }
 
     fn bash(&self, command: &str, timeout: Duration, progress: &mut dyn FnMut(&str)) -> Output {
-        let shell = if Path::new("/bin/bash").exists() {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
+        let (mut cmd, what) = match &self.sandbox {
+            Some(s) => (s.shell(&self.cwd, command), "ssh"),
+            None => {
+                let shell = if Path::new("/bin/bash").exists() {
+                    "/bin/bash"
+                } else {
+                    "/bin/sh"
+                };
+                let mut cmd = Command::new(shell);
+                cmd.arg("-c")
+                    .arg(command)
+                    .current_dir(&self.cwd)
+                    .env("PAGER", "cat")
+                    .env("GIT_PAGER", "cat")
+                    .env("NO_COLOR", "1")
+                    .env("TERM", "dumb");
+                (cmd, shell)
+            }
         };
-        let mut cmd = Command::new(shell);
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(&self.cwd)
-            .stdin(Stdio::null())
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("PAGER", "cat")
-            .env("GIT_PAGER", "cat")
-            .env("NO_COLOR", "1")
-            .env("TERM", "dumb");
+            .stderr(Stdio::piped());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -490,24 +534,16 @@ impl Env {
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return failure(format!("{shell}: {e}")),
+            Err(e) => return failure(format!("{what}: {e}")),
         };
         let job = self.procs.add(command, &self.owner, child.id());
-        let readers: Vec<_> = [
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|mut pipe| {
+        // in a sandbox, the shell's exit status there, from its mark: ssh
+        // lasts while what it left in the background holds the output
+        let exit: Arc<std::sync::Mutex<Option<i32>>> = Default::default();
+        let mut readers = Vec::new();
+        if let Some(mut pipe) = child.stdout.take() {
             let job = job.clone();
-            std::thread::spawn(move || {
+            readers.push(std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 while let Ok(n) = pipe.read(&mut buf) {
                     if n == 0 {
@@ -515,9 +551,42 @@ impl Env {
                     }
                     job.out.lock().unwrap().push(&buf[..n]);
                 }
-            })
-        })
-        .collect();
+            }));
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let job = job.clone();
+            let sandbox = self.sandbox.clone();
+            let exit = exit.clone();
+            readers.push(std::thread::spawn(move || {
+                let mut demux = sandbox.as_ref().map(|s| s.demux());
+                let mut buf = [0u8; 8192];
+                let mut marks = Vec::new();
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let Some(d) = demux.as_mut() else {
+                        job.out.lock().unwrap().push(&buf[..n]);
+                        continue;
+                    };
+                    let data = d.feed(&buf[..n], &mut marks);
+                    job.out.lock().unwrap().push(&data);
+                    for m in marks.drain(..) {
+                        match (m, &sandbox) {
+                            (Mark::Pid(pgid), Some(s)) => {
+                                let s = s.clone();
+                                job.on_kill(Box::new(move || s.kill_group(pgid)));
+                            }
+                            (Mark::Exit(code), _) => *exit.lock().unwrap() = Some(code),
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(d) = demux.as_mut() {
+                    job.out.lock().unwrap().push(&d.finish());
+                }
+            }));
+        }
 
         let start = job.start;
         let mut sent = 0;
@@ -530,11 +599,34 @@ impl Env {
             }
         };
         let mut killed = None;
-        let status = loop {
+        // the shell's exit code, None if killed by a signal; whether its
+        // connection was lost, in a sandbox
+        let (code, lost) = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(_) => break None,
+                Ok(Some(status)) => {
+                    // its output may still come with its mark
+                    let mut marked = *exit.lock().unwrap();
+                    if self.sandbox.is_some() && marked.is_none() {
+                        let t = Instant::now();
+                        while !readers.iter().all(|r| r.is_finished())
+                            && t.elapsed() < BACKGROUND_AFTER
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        marked = *exit.lock().unwrap();
+                    }
+                    break match (&self.sandbox, marked) {
+                        (Some(_), Some(c)) => (Some(c), false),
+                        (Some(_), None) => (status.code(), killed.is_none()),
+                        (None, _) => (status.code(), false),
+                    };
+                }
+                Ok(None) => {
+                    if let Some(c) = *exit.lock().unwrap() {
+                        break (Some(c), false);
+                    }
+                }
+                Err(_) => break (None, false),
             }
             if killed.is_none() {
                 if self.stop.load(Ordering::SeqCst) {
@@ -577,26 +669,30 @@ impl Env {
                         && since_kill.get_or_insert_with(Instant::now).elapsed()
                             > Duration::from_secs(2)
                     {
+                        let _ = child.kill();
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
+                // ssh, in a sandbox, ends with the output
+                let _ = child.wait();
                 procs.remove(job.id);
             });
         } else {
             for r in readers {
                 let _ = r.join();
             }
+            let _ = child.wait();
             self.procs.remove(job.id);
         }
         stream(progress);
         let text = strip_ansi(&job.out.lock().unwrap().text());
         let text = text.trim_end();
-        let code = status.and_then(|s| s.code());
         let mut result = middle_out(text, MAX_OUTPUT);
         let ok = killed.is_none() && code == Some(0);
         let mut status = match (killed, code) {
             (Some(why), _) => format!("[{why} after {:.0}s]", start.elapsed().as_secs_f64()),
+            (None, _) if lost => "[the connection to the sandbox was lost]".into(),
             (None, Some(0)) => String::new(),
             (None, Some(c)) => format!("[exit code {c}]"),
             (None, None) => "[killed by a signal]".into(),
@@ -639,24 +735,22 @@ impl Env {
         root: &Path,
         include: Option<&globset::GlobMatcher>,
     ) -> Output {
+        let included = |path: &Path| match include {
+            None => true,
+            Some(g) => {
+                let rel = path.strip_prefix(root).unwrap_or(path);
+                g.is_match(rel) || path.file_name().is_some_and(|n| g.is_match(n))
+            }
+        };
         let mut out = String::new();
         let mut matches = 0;
         let mut files = 0;
-        'walk: for entry in walk(root) {
-            let path = entry.path();
-            if let Some(g) = include {
-                let rel = path.strip_prefix(root).unwrap_or(path);
-                if !g.is_match(rel) && !path.file_name().is_some_and(|n| g.is_match(n)) {
-                    continue;
-                }
-            }
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
+        // false once there are enough matches
+        let mut search = |path: &Path, bytes: &[u8]| {
             if bytes.iter().take(8192).any(|&b| b == 0) {
-                continue;
+                return true;
             }
-            let text = String::from_utf8_lossy(&bytes);
+            let text = String::from_utf8_lossy(bytes);
             let mut found = false;
             for (i, line) in text.lines().enumerate() {
                 if re.is_match(line) {
@@ -666,7 +760,7 @@ impl Env {
                     }
                     matches += 1;
                     if matches > MAX_RESULTS {
-                        break 'walk;
+                        return false;
                     }
                     let _ = writeln!(
                         out,
@@ -675,6 +769,33 @@ impl Env {
                         i + 1,
                         clip(line.trim_end(), 300)
                     );
+                }
+            }
+            true
+        };
+        match &self.sandbox {
+            None => {
+                for entry in walk(root) {
+                    let path = entry.path();
+                    if !included(path) {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(path) else {
+                        continue;
+                    };
+                    if !search(path, &bytes) {
+                        break;
+                    }
+                }
+            }
+            // the files there copied here, to search them the same way
+            Some(s) => {
+                let paths: Vec<PathBuf> = match s.files(root) {
+                    Ok(p) => p.into_iter().filter(|p| included(p)).collect(),
+                    Err(e) => return failure(format!("{}: {e}", self.show(root))),
+                };
+                if let Err(e) = s.fetch(&paths, MAX_GREP_FILE, &mut |p, e| search(&p, &e.data)) {
+                    return failure(e);
                 }
             }
         }
@@ -703,6 +824,21 @@ impl Env {
     }
 
     fn glob(&self, glob: &globset::GlobMatcher, root: &Path) -> Output {
+        if let Some(s) = &self.sandbox {
+            let found: Vec<PathBuf> = match s.files(root) {
+                Ok(p) => p
+                    .into_iter()
+                    .filter(|p| glob.is_match(p.strip_prefix(root).unwrap_or(p)))
+                    .collect(),
+                Err(e) => return failure(format!("{}: {e}", self.show(root))),
+            };
+            let found = if found.len() <= MAX_SORTED {
+                s.newest_first(found)
+            } else {
+                found
+            };
+            return self.found(found.into_iter());
+        }
         let mut found: Vec<(SystemTime, PathBuf)> = walk(root)
             .filter(|e| {
                 let rel = e.path().strip_prefix(root).unwrap_or(e.path());
@@ -718,11 +854,15 @@ impl Env {
             })
             .collect();
         found.sort_by_key(|f| std::cmp::Reverse(f.0));
+        self.found(found.into_iter().map(|(_, p)| p))
+    }
+
+    /// The files a glob found, most recent first
+    fn found(&self, found: impl ExactSizeIterator<Item = PathBuf>) -> Output {
         let n = found.len();
         let mut out: String = found
-            .iter()
             .take(MAX_RESULTS)
-            .map(|(_, p)| self.show(p) + "\n")
+            .map(|p| self.show(&p) + "\n")
             .collect();
         if n > MAX_RESULTS {
             let _ = write!(out, "({n} files, only the {MAX_RESULTS} most recent shown)");
@@ -739,14 +879,17 @@ impl Env {
 
     fn list(&self, path: &Path) -> Result<Output, String> {
         let shown = self.show(path);
-        let mut entries: Vec<String> = std::fs::read_dir(path)
-            .map_err(|e| format!("{shown}: {e}"))?
-            .filter_map(Result::ok)
-            .map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if e.path().is_dir() { name + "/" } else { name }
-            })
-            .collect();
+        let mut entries: Vec<String> = match &self.sandbox {
+            Some(s) => s.list(path).map_err(|e| format!("{shown}: {e}"))?,
+            None => std::fs::read_dir(path)
+                .map_err(|e| format!("{shown}: {e}"))?
+                .filter_map(Result::ok)
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if e.path().is_dir() { name + "/" } else { name }
+                })
+                .collect(),
+        };
         entries.sort();
         let n = entries.len();
         let mut out = entries
@@ -800,14 +943,15 @@ pub fn plan_request(call: &ToolCall) -> Result<(String, String), String> {
     Ok((overview, tasks))
 }
 
-/// A command the user runs (`!`), in `cwd`: listed in `procs`, where it can
-/// be killed
-pub fn shell(cwd: &Path, command: &str, procs: &Procs) -> Output {
+/// A command the user runs (`!`), in `cwd`, or in the sandbox's work
+/// directory: listed in `procs`, where it can be killed
+pub fn shell(cwd: &Path, command: &str, procs: &Procs, sandbox: Option<Arc<Sandbox>>) -> Output {
     let env = Env {
-        cwd: cwd.to_path_buf(),
+        cwd: sandbox.as_ref().map_or_else(|| cwd.to_path_buf(), |s| s.root.clone()),
         stop: Arc::new(AtomicBool::new(false)),
         procs: procs.clone(),
         owner: "you".into(),
+        sandbox,
     };
     env.bash(command, Duration::from_secs(600), &mut |_| {})
 }
@@ -978,6 +1122,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 procs: Procs::default(),
                 owner: "agent".into(),
+                sandbox: None,
             },
             dir,
         )
@@ -1180,6 +1325,151 @@ mod tests {
         assert!(out.text.contains("killed by the user"), "{}", out.text);
         assert!(env.procs.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// In a VM of vemu's, with the tools of an [`Env`]: run with
+    /// `VCODE_TEST_IMAGE=golden.raw VCODE_TEST_KERNEL=Image cargo test in_a_vm -- --ignored`
+    /// (`VCODE_VEMU` for a vemu binary not on the PATH)
+    #[test]
+    #[ignore]
+    fn in_a_vm() {
+        let image = std::env::var("VCODE_TEST_IMAGE").expect("VCODE_TEST_IMAGE");
+        let kernel = std::env::var("VCODE_TEST_KERNEL").expect("VCODE_TEST_KERNEL");
+        in_a_sandbox(
+            &format!("vemu:t,image={image},kernel={kernel},memory=1G,cpus=2"),
+            "vemu:t",
+        );
+    }
+
+    /// On a host over ssh, reached without a password: run with
+    /// `VCODE_TEST_HOST=[user@]host[:port] cargo test on_a_host -- --ignored`
+    #[test]
+    #[ignore]
+    fn on_a_host() {
+        let host = std::env::var("VCODE_TEST_HOST").expect("VCODE_TEST_HOST");
+        let spec = format!("ssh:{host}");
+        in_a_sandbox(&spec, &spec);
+    }
+
+    /// The tools in the sandbox `first`, then again in `again`: the same one
+    fn in_a_sandbox(first: &str, again: &str) {
+        use crate::sandbox::{Kind as Change, Sandbox, Spec};
+        let base = std::env::temp_dir().join(format!("vcode-sb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let local = base.join("proj");
+        std::fs::create_dir_all(local.join("src")).unwrap();
+        std::fs::create_dir_all(local.join("target/debug")).unwrap();
+        // SAFETY: this test runs alone (--ignored, by name)
+        unsafe { std::env::set_var("XDG_DATA_HOME", base.join("data")) };
+        std::fs::write(local.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(local.join("src/a.rs"), "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+        std::fs::write(local.join("notes.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(local.join("target/debug/big"), "ignored").unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git").args(args).current_dir(&local).output().unwrap().status.success())
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+
+        let spec = Spec::parse(first).unwrap();
+        let say = &mut |s: &str| eprintln!("  {s}");
+        let sb = Arc::new(Sandbox::start(&spec, &local, say).unwrap());
+        let env = Env {
+            cwd: sb.root.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+            procs: Procs::default(),
+            owner: "agent".into(),
+            sandbox: Some(sb.clone()),
+        };
+        let out = run(&env, call("read_file", &[("path", "src/a.rs")]));
+        assert!(out.text.contains("println!(\"hi\")"), "{}", out.text);
+        assert!(run(&env, call("read_file", &[("path", "src")])).text.contains("is a directory"));
+        assert!(!run(&env, call("read_file", &[("path", "nope")])).ok);
+        let out = run(&env, call("list_dir", &[]));
+        assert_eq!(out.text, ".git/\n.gitignore\nnotes.txt\nsrc/", "{}", out.text);
+        let out = run(&env, call("glob", &[("pattern", "**/*.rs")]));
+        assert_eq!(out.text.trim(), "src/a.rs");
+        let out = run(&env, call("grep", &[("pattern", r"print\w+")]));
+        assert!(out.text.contains("src/a.rs:2:"), "{}", out.text);
+        // an edit and a new file, there
+        let out = run(
+            &env,
+            call(
+                "edit_file",
+                &[("path", "src/a.rs"), ("old_string", "\"hi\""), ("new_string", "\"bye\"")],
+            ),
+        );
+        assert!(out.ok, "{}", out.text);
+        assert!(run(&env, call("write_file", &[("path", "new/b.txt"), ("content", "b\n")])).ok);
+        assert!(std::fs::read_to_string(local.join("src/a.rs")).unwrap().contains("hi"));
+        // commands there
+        let out = run(&env, call("bash", &[("command", "pwd; uname -s; cat new/b.txt; git status --short; exit 3")]));
+        assert!(!out.ok);
+        assert!(out.text.contains(&sb.root.display().to_string()), "{}", out.text);
+        assert!(out.text.contains("Linux") && out.text.contains("b\n"), "{}", out.text);
+        assert!(out.text.contains("M src/a.rs") && out.text.contains("[exit code 3]"), "{}", out.text);
+        assert!(!out.text.contains('\u{1e}'), "marks left in: {:?}", out.text);
+        let t = Instant::now();
+        let out = run(&env, call("bash", &[("command", "sleep 30"), ("timeout", "1")]));
+        assert!(t.elapsed() < Duration::from_secs(5) && out.text.contains("timed out"), "{}", out.text);
+        // left in the background, then killed from the list: there too
+        let t = Instant::now();
+        let out = run(&env, call("bash", &[("command", "sleep 31 & echo started")]));
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(out.ok && out.text.contains("started") && out.text.contains("background"), "{}", out.text);
+        let list = env.procs.list();
+        assert_eq!(list.len(), 1);
+        assert!(env.procs.kill(list[0].id));
+        assert!(eventually(|| env.procs.is_empty()));
+        let ps = run(&env, call("bash", &[("command", "{ ps -eo args 2>/dev/null || ps -o args; } | grep -c '^sleep 3[01]' || true")]));
+        assert_eq!(ps.text.trim(), "0", "{}", ps.text);
+
+        // changed on both sides: a conflict, left alone
+        assert!(run(&env, call("bash", &[("command", "echo there >> notes.txt; mkdir -p target && echo x > target/out")])).ok);
+        std::fs::write(local.join("notes.txt"), "one\ntwo\nhere\n").unwrap();
+        let changes = sb.changes().unwrap();
+        let got: Vec<_> = changes.iter().map(|c| (c.path.as_str(), c.kind, c.conflict)).collect();
+        assert_eq!(
+            got,
+            [
+                ("new/b.txt", Change::Added, false),
+                ("notes.txt", Change::Modified, true),
+                ("src/a.rs", Change::Modified, false),
+            ]
+        );
+        let diff = sb.diff().unwrap();
+        let a = diff.iter().find(|d| d.change.path == "src/a.rs").unwrap();
+        assert_eq!(count_changes(a.lines.as_ref().unwrap()), (1, 1));
+        let report = sb.pull().unwrap();
+        assert_eq!((report.files, report.conflicts.clone()), (2, vec!["notes.txt".to_string()]));
+        assert!(std::fs::read_to_string(local.join("src/a.rs")).unwrap().contains("bye"));
+        assert_eq!(std::fs::read_to_string(local.join("new/b.txt")).unwrap(), "b\n");
+        assert_eq!(std::fs::read_to_string(local.join("notes.txt")).unwrap(), "one\ntwo\nhere\n");
+        assert!(!local.join("target/out").exists());
+        assert_eq!(sb.changes().unwrap().len(), 1);
+        sb.stop();
+
+        // kept: the next start copies only what changed here
+        std::fs::write(local.join("c.txt"), "c\n").unwrap();
+        std::fs::remove_file(local.join("new/b.txt")).unwrap();
+        let mut said = Vec::new();
+        let sb = Arc::new(Sandbox::start(&Spec::parse(again).unwrap(), &local, &mut |s| {
+            eprintln!("  {s}");
+            said.push(s.to_string())
+        }).unwrap());
+        assert!(said.iter().any(|s| s.contains("copied 1 file") && s.contains("1 deleted")), "{said:?}");
+        assert!(said.iter().any(|s| s.contains("notes.txt")), "{said:?}");
+        let env = Env { sandbox: Some(sb.clone()), cwd: sb.root.clone(), ..env };
+        let out = run(&env, call("bash", &[("command", "cat c.txt notes.txt; ls new")]));
+        assert!(out.text.contains("c\n") && out.text.contains("there"), "{}", out.text);
+        assert!(!out.text.contains("b.txt"), "{}", out.text);
+        // a host keeps its work directories: this one goes
+        let root = sb.root.display().to_string();
+        let out = sb.run(r#"rm -rf -- "$1" "$1.vcode-stamp""#, &[&root], None).unwrap();
+        assert_eq!(out.code, Some(0), "{}", out.stderr);
+        sb.stop();
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

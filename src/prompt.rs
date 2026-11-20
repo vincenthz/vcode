@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::roles::Role;
+use crate::tools::Env;
 
 const BASE: &str = "\
 You are vcode, a coding agent running in the user's terminal, on their machine. You help with \
@@ -118,46 +119,60 @@ const MAX_INSTRUCTIONS: usize = 16_000;
 
 /// The agent's, which may give tasks to subagents, several at the same
 /// time if `parallel`
-pub fn system(cwd: &Path, subagents: bool, parallel: bool) -> String {
+pub fn system(env: &Env, subagents: bool, parallel: bool) -> String {
     let task = match (subagents, parallel) {
         (false, _) => String::new(),
         (true, false) => TASK.to_string(),
         (true, true) => format!("{TASK}{TASK_PARALLEL}"),
     };
     let mut s = BASE.replace("{TASK}", &task);
-    environment(cwd, &mut s);
+    environment(env, &mut s);
     s
 }
 
 /// A subagent's, for its role
-pub fn subagent(cwd: &Path, role: Role) -> String {
+pub fn subagent(env: &Env, role: Role) -> String {
     let mut s = SUBAGENT
         .replace("{ROLE}", role.name())
         .replace("{INSTRUCTIONS}", role.instructions());
-    environment(cwd, &mut s);
+    environment(env, &mut s);
     s
 }
 
 /// The pilot's: an agent that only directs subagents, several at the same
 /// time if `parallel`
-pub fn pilot(cwd: &Path, parallel: bool) -> String {
+pub fn pilot(env: &Env, parallel: bool) -> String {
     let mut s = PILOT.replace(
         "{PARALLEL}",
         if parallel { PILOT_PARALLEL } else { PILOT_ONE },
     );
-    environment(cwd, &mut s);
+    environment(env, &mut s);
     s
 }
 
-/// The working directory, the platform, the project's instructions
-fn environment(cwd: &Path, s: &mut String) {
+/// The working directory, the platform, the project's instructions: of the
+/// sandbox, when the tools run in one (what is read of the project is read
+/// here, from the copy it was made of)
+fn environment(env: &Env, s: &mut String) {
+    let cwd = env.sandbox.as_ref().map_or(env.cwd.as_path(), |b| b.local.as_path());
     s.push_str("\n\n# Environment\n");
-    s.push_str(&format!("- Working directory: {}\n", cwd.display()));
-    s.push_str(&format!(
-        "- Platform: {} {}\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    ));
+    s.push_str(&format!("- Working directory: {}\n", env.cwd.display()));
+    match &env.sandbox {
+        Some(b) => {
+            s.push_str(&format!("- Platform: {}\n", b.platform.to_lowercase()));
+            s.push_str(&format!(
+                "- Sandbox: you work in {}, on a copy of the user's project. Your commands and \
+                 changes to files stay there; the user brings changes back to their machine when \
+                 they choose\n",
+                b.describe()
+            ));
+        }
+        None => s.push_str(&format!(
+            "- Platform: {} {}\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )),
+    }
     s.push_str(&format!("- Date: {}\n", today()));
     match git_branch(cwd) {
         Some(b) => s.push_str(&format!("- Git repository, on branch {b}\n")),

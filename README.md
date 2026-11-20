@@ -120,6 +120,51 @@ The plan shows in the transcript (✓ done, ◐ in progress, ○ to do, ✗ bloc
 and its progress in the status line, and it is carried over when the
 conversation is compacted.
 
+## Sandbox
+
+With `--sandbox`, every tool runs on another machine, in a work directory that
+holds a copy of the project: the files read, searched and edited are those
+there, and commands run there. The copy is made at the start, and kept between
+sessions: the next start copies only what changed here since.
+
+```sh
+vcode --sandbox ssh:devbox                    # a host, in ~/vcode/<project>
+vcode --sandbox ssh:me@host:2222,dir=/srv/w   # another port, another directory
+vcode --sandbox vemu:dev,image=alpine.raw,kernel=Image   # a VM, made the first time
+vcode --sandbox vemu:dev                      # and started again afterwards
+```
+
+A `vemu:` sandbox is a VM run by [vemu](https://github.com/vincenthz/vemu), on
+a golden image from `vemu build` (with ssh for your key, and git) and the
+kernel it was built with. Made on first use, its overlay and settings
+(`memory=`, `cpus=`, `key=`, `append=`) are kept in
+`~/.local/share/vcode/vms/NAME`, and it is booted for each session, with a free
+port of this host forwarded to its ssh server, and powered off at the end. Its
+console goes to `console.log` there. Nothing asks for approval in a VM (shift+tab
+still changes that); on an ssh host, approvals are as without a sandbox. The
+agent is told where it works, and that in a VM it may install what it needs.
+
+What is copied: the files the project's `.gitignore` files don't ignore (so
+not `target/`, nor an ignored `.env`), and the repository itself. Changes made
+there come back only when you ask:
+
+- `/sandbox` lists the files changed there since the copy
+- `/sandbox diff` shows them, as diffs from the files here
+- `/sandbox pull` brings them here; `/sandbox push` copies there what changed
+  here since (both wait for the agent to be done)
+- `-p … --pull` pulls once the task is done
+
+A file changed on both sides is left as it is on both, and said so. Commits
+made there stay there (pull brings the working tree only). `!cmd` runs in the
+sandbox too; `!!cmd` runs here. On quitting, vcode says what was changed there
+and not pulled: it is still there next time.
+
+Everything goes through one ssh connection (ControlMaster), opened before the
+interface starts, so a password or a passphrase can be asked for. The other
+side needs only a POSIX shell, `find`, `tar` and `cksum` (busybox will do),
+and uses `git` and `bash` when it has them. A command killed from the list
+(ctrl+p) is killed there, with what it started.
+
 ## Interface
 
 - enter sends; shift+enter, alt+enter, ctrl+j, or `\` then enter, start a new line
@@ -133,7 +178,8 @@ conversation is compacted.
   ssh through the terminal (OSC 52; in tmux, `set -g set-clipboard on`).
   `--no-mouse` leaves the mouse to the terminal instead
 - up/down go through the history
-- `!cmd` runs a shell command; its output goes to the model with your next message
+- `!cmd` runs a shell command (in the sandbox, if any; `!!cmd` here); its
+  output goes to the model with your next message
 - ctrl+p (or `/ps`) lists the shell commands running, the agents' and yours:
   ↑/↓ select, `k` kills one with everything it started, esc closes. A command
   whose shell exits but leaves processes running (`npm run dev &`) returns to
@@ -152,7 +198,7 @@ conversation is compacted.
 
 Commands: `/clear`, `/ps`, `/compact` (replace the conversation with the model's
 summary of it, which also happens by itself at 80% of the context), `/pilot`,
-`/think`, `/nothink`, `/mode`, `/context`, `/bell`, `/notify`, `/help`, `/quit`.
+`/think`, `/nothink`, `/mode`, `/context`, `/bell`, `/notify`, `/sandbox`, `/help`, `/quit`.
 
 The context is 256k tokens by default (`-c`), at most the model's; a session
 allocates its whole KV cache up front, about 6.5 GB with the 35B-A3B at 256k.
@@ -170,6 +216,8 @@ tasks that start from then on. Sizes are tokens, or with `k` or `m`.
 | `src/roles.rs` | the kinds of subagents: instructions, tools |
 | `src/tools.rs` | tool definitions (as the chat template's `tojson` writes them), planning (argument checks, diffs) and running |
 | `src/procs.rs` | the shell commands running, listed and killed from the interface |
+| `src/sandbox.rs` | sandboxes: ssh hosts and vemu VMs, the tools' operations there, copying both ways |
+| `src/tar.rs` | the tar archives the copies go in, and `cksum`'s CRC |
 | `src/prompt.rs` | the system prompts: agent, pilot, subagents |
 | `src/ui/mod.rs` | the ratatui interface: transcript, approvals, status |
 | `src/ui/text.rs` | word wrapping, a little Markdown |

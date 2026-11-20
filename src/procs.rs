@@ -37,7 +37,12 @@ pub struct Job {
     killed: AtomicBool,
     background: AtomicBool,
     pub out: Mutex<Capture>,
+    /// kills what it runs elsewhere, in a sandbox: its shell there, once known
+    remote: Mutex<Option<Killer>>,
 }
+
+/// Kills a command's processes on the other side
+pub type Killer = Box<dyn Fn() + Send + Sync>;
 
 /// A command as listed
 pub struct Info {
@@ -65,6 +70,7 @@ impl Procs {
             killed: AtomicBool::new(false),
             background: AtomicBool::new(false),
             out: Mutex::new(Capture::default()),
+            remote: Mutex::new(None),
         });
         self.jobs().push(job.clone());
         job
@@ -113,10 +119,23 @@ impl Procs {
 }
 
 impl Job {
-    /// Kill its process group
+    /// Kill its process group, there first when it runs in a sandbox (the
+    /// local one is then ssh's)
     pub fn kill(&self) {
         self.killed.store(true, Ordering::SeqCst);
+        if let Some(k) = self.remote.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            k();
+        }
         kill_group(self.pid);
+    }
+
+    /// How to kill it there, once its shell there is known
+    pub fn on_kill(&self, killer: Killer) {
+        // killed before
+        if self.killed() {
+            killer();
+        }
+        *self.remote.lock().unwrap_or_else(|e| e.into_inner()) = Some(killer);
     }
 
     pub fn killed(&self) -> bool {

@@ -4,6 +4,8 @@ mod agent;
 mod procs;
 mod prompt;
 mod roles;
+mod sandbox;
+mod tar;
 mod tools;
 mod trace;
 mod ui;
@@ -69,6 +71,18 @@ usage: vcode [options] [directory]
                            or the system (also /notify on, /notify off)
       --trace <file>       trace the prompts, tokens and tool calls of the
                            agents to a file (also /debug <file>, /debug off)
+  -s, --sandbox <spec>     run the tools in a sandbox, on a copy of the directory:
+                             ssh:[user@]host[:port][,dir=PATH]
+                               a host reached by ssh, in ~/vcode/<project> (or dir)
+                             vemu:NAME[,image=PATH,kernel=PATH,memory=4G,cpus=4,
+                                  key=PATH,vemu=PATH,append=CMDLINE]
+                               a VM of vemu's, made on first use from the golden
+                               image and its kernel, kept afterwards; nothing asks
+                               for approval in it
+                           Later starts copy only what changed. Changes made there
+                           come here with /sandbox pull
+      --pull               with -p and --sandbox: pull the changes made in the
+                           sandbox once the task is done
   -h, --help
 
 The directory, the current one by default, is where the agent works. Its
@@ -82,6 +96,8 @@ struct Args {
     bell: bool,
     notify: bool,
     trace: Option<PathBuf>,
+    sandbox: Option<sandbox::Spec>,
+    pull: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -101,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
             cwd: std::env::current_dir().map_err(|e| e.to_string())?,
             parallel: 4,
             procs: procs::Procs::default(),
+            sandbox: None,
         },
         prompt: None,
         yolo: false,
@@ -108,6 +125,8 @@ fn parse_args() -> Result<Args, String> {
         bell: true,
         notify: false,
         trace: None,
+        sandbox: None,
+        pull: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -147,6 +166,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-bell" => a.bell = false,
             "--notify" => a.notify = true,
             "--trace" => a.trace = Some(PathBuf::from(val()?)),
+            "-s" | "--sandbox" => a.sandbox = Some(sandbox::Spec::parse(&val()?)?),
+            "--pull" => a.pull = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -164,11 +185,14 @@ fn parse_args() -> Result<Args, String> {
     if a.cfg.model.is_empty() {
         a.cfg.model = default_model();
     }
+    if a.pull && (a.sandbox.is_none() || a.prompt.is_none()) {
+        return Err("--pull goes with --sandbox and -p".into());
+    }
     Ok(a)
 }
 
 fn main() {
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
@@ -181,6 +205,19 @@ fn main() {
         eprintln!("error: --trace {e}");
         std::process::exit(2);
     }
+    // before the interface: ssh may ask for a password
+    let sandbox = args.sandbox.as_ref().map(|spec| {
+        match sandbox::Sandbox::start(spec, &args.cfg.cwd, &mut |s| eprintln!("vcode: {s}")) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                eprintln!("error: sandbox: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+    args.cfg.sandbox = sandbox.clone();
+    // nothing to approve in a VM of its own
+    let yolo = args.yolo || sandbox.as_ref().is_some_and(|s| s.vm);
     let stop = Arc::new(AtomicBool::new(false));
     let procs = args.cfg.procs.clone();
     let (cmd_tx, cmd_rx) = channel();
@@ -188,25 +225,36 @@ fn main() {
     agent::spawn(args.cfg.clone(), cmd_rx, msg_tx.clone(), stop.clone());
 
     if let Some(prompt) = args.prompt {
-        let status = headless(&prompt, args.yolo, cmd_tx, msg_rx);
+        let status = headless(&prompt, yolo, cmd_tx, msg_rx);
         // what commands left running in the background
         procs.kill_all();
+        if let Some(s) = &sandbox
+            && args.pull
+        {
+            match s.pull() {
+                Ok(r) => eprintln!("vcode: {}", r.describe("pulled", "from", &s.label)),
+                Err(e) => eprintln!("error: sandbox: {e}"),
+            }
+        }
+        close(sandbox.as_deref());
         trace::stop();
         std::process::exit(status);
     }
     let opts = ui::Options {
         cwd: args.cfg.cwd,
         thinking: args.cfg.thinking,
-        accept_all: args.yolo,
+        accept_all: yolo,
         mouse: args.mouse,
         bell: args.bell,
         desktop: args.notify,
         theme: ui::themes::Theme::default(),
         procs: procs.clone(),
+        sandbox: sandbox.clone(),
     };
     let result = ui::run(opts, cmd_tx, msg_tx, msg_rx, stop);
     // the commands running, and those left in the background
     procs.kill_all();
+    close(sandbox.as_deref());
     // the tokens not written yet
     trace::stop();
     if let Err(e) = result {
@@ -215,6 +263,29 @@ fn main() {
     }
     // the agent thread may be in the middle of an answer: don't wait for it
     std::process::exit(0);
+}
+
+/// Stop the sandbox, saying what changed there that wasn't pulled: it is
+/// kept there for the next time
+fn close(sandbox: Option<&sandbox::Sandbox>) {
+    let Some(s) = sandbox else {
+        return;
+    };
+    match s.changes() {
+        Ok(c) if !c.is_empty() => eprintln!(
+            "vcode: {} file{} changed in {} and not pulled; they are kept there \
+             (/sandbox pull, after starting vcode with the same --sandbox)",
+            c.len(),
+            if c.len() == 1 { "" } else { "s" },
+            s.label
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("vcode: sandbox {}: {e}", s.label),
+    }
+    if s.vm {
+        eprintln!("vcode: stopping the VM {}…", s.label);
+    }
+    s.stop();
 }
 
 /// One task, its transcript on stdout: for scripts and tests
