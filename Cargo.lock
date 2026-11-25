@@ -83,7 +83,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "biv"
 version = "0.1.0"
-source = "git+https://github.com/vincenthz/biv#ae92b8d5ac417a419fba4d8227724a68eda6e3b8"
+source = "git+https://github.com/vincenthz/biv#c7fabd8f7e9a5e20ace59ba23ec3c7d59ec05099"
 dependencies = [
  "libm",
  "objc2",
@@ -96,7 +96,7 @@ dependencies = [
 [[package]]
 name = "biv-cli"
 version = "0.1.0"
-source = "git+https://github.com/vincenthz/biv#ae92b8d5ac417a419fba4d8227724a68eda6e3b8"
+source = "git+https://github.com/vincenthz/biv#c7fabd8f7e9a5e20ace59ba23ec3c7d59ec05099"
 dependencies = [
  "biv",
  "ctrlc",
